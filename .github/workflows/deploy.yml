@@ -1,0 +1,43 @@
+# Render's API-created services have no GitHub webhook (that needs the Render GitHub App and
+# an interactive OAuth grant), so autoDeploy never fires on push. This closes that gap by
+# asking Render to deploy directly.
+#
+# Requires one repository secret: RENDER_API_KEY (Render dashboard -> Account Settings -> API
+# Keys). The service ID below is not a secret.
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: render-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: srv-da7mmmvavr4c73b58ov0
+        run: |
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "RENDER_API_KEY is not set; skipping. Add it under Settings -> Secrets."
+            exit 0
+          fi
+          response=$(curl -sS -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"clearCache":"do_not_clear"}' \
+            "https://api.render.com/v1/services/$SERVICE_ID/deploys")
+          body=$(echo "$response" | sed '$d')
+          code=$(echo "$response" | tail -n1)
+          echo "$body"
+          if [ "$code" != "201" ] && [ "$code" != "200" ]; then
+            echo "Render returned HTTP $code"
+            exit 1
+          fi
+          echo "Deploy queued. The dlib compile makes this a ~6 minute build."

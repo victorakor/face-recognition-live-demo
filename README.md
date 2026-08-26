@@ -4,8 +4,12 @@ A browser demo of a two-stage vision pipeline: custom YOLOv8 weights find faces,
 what is covering them, and flag weapons; dlib's ResNet encoder then turns each face into a
 128-d embedding and matches it against an enrolled gallery.
 
-**Source:** [github.com/victorakor/face-recognition-live-demo](https://github.com/victorakor/face-recognition-live-demo)
-· **Live:** see [Deployment](#deployment)
+**Live:** [face-recognition-live-demo.onrender.com](https://face-recognition-live-demo.onrender.com)
+· **Source:** [github.com/victorakor/face-recognition-live-demo](https://github.com/victorakor/face-recognition-live-demo)
+
+> Hosted on Render's free tier, which spins the container down after 15 minutes idle. If it's
+> been quiet, the first request takes 30–60 s to wake and load the weights — the page shows
+> "warming up the model…" while that happens.
 
 No accounts, no login, no database. Open the page, allow the camera, and the model runs on
 your own webcam feed. If you would rather not turn a camera on, there is a photo-upload
@@ -229,13 +233,35 @@ match the ones this gallery was built from.
 
 `render.yaml` is a Docker blueprint — point Render at this repo (New → Blueprint) and it
 builds and deploys. The whole stack fits the 512 MB free instance because of the ONNX swap
-above; nothing needs disabling.
+above; nothing needs disabling. The build takes ~6 minutes, almost all of it compiling dlib.
 
-Cold start is roughly 25–40 s while ~130 MB of weights load, and the free instance also spins
-down after 15 minutes idle, so the first request after a quiet period pays that again. The
-page polls `/api/info` and shows "warming up the model…" until the models are up, while
-`/api/health` answers immediately throughout so the platform health check can't kill the
-container mid-load.
+Measured on the live free instance (0.1 CPU), which is the honest performance picture:
+
+| | Value |
+| --- | --- |
+| Detection | 464–531 ms |
+| Recognition (1 face) | 198–203 ms |
+| Total per frame | ~670 ms (≈1.5 fps) |
+| `blas` | `true` — the source build worked |
+
+Recognition at ~200 ms rather than ~1000 ms is the entire payoff of compiling dlib against
+OpenBLAS. Detection results are identical to local, down to the distance (0.3074).
+
+Cold start is 25–40 s while ~130 MB of weights load, and the free instance spins down after 15
+minutes idle, so the first request after a quiet period pays that again. The page polls
+`/api/info` and shows "warming up the model…" until the models are up, while `/api/health`
+answers immediately throughout so the platform health check can't kill the container mid-load.
+
+Services created through the Render API have no GitHub webhook — that needs the Render GitHub
+App and an interactive OAuth grant — so `autoDeploy` does not fire on push.
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) covers that by calling the
+Render API directly; add a `RENDER_API_KEY` repository secret to enable it. Or deploy by hand:
+
+```bash
+curl -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+     -H 'Content-Type: application/json' -d '{"clearCache":"do_not_clear"}' \
+     https://api.render.com/v1/services/srv-da7mmmvavr4c73b58ov0/deploys
+```
 
 **Hugging Face Spaces no longer works on the free tier** for this app. As of 2026, Docker and
 Gradio Spaces on free `cpu-basic` require a PRO subscription — the API refuses the create call
