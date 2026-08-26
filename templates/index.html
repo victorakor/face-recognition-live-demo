@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Face Recognition — YOLOv8 + dlib</title>
+  <meta name="description" content="Browser-camera demo of a YOLOv8 detector for faces, face coverings and weapons, paired with a dlib ResNet face-recognition model. No sign-up, no stored video." />
+  <link rel="icon" href="{{ url_for('static', filename='favicon.png') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <div>
+        <strong>Live Face Recognition</strong>
+        <small>YOLOv8 face / covering / weapon detection &middot; dlib ResNet identification</small>
+      </div>
+    </div>
+    <div class="topbar-meta">
+      <span class="pill" id="backendPill" title="Active detection backend">loading model…</span>
+      <a class="pill link" id="repoLink" href="https://github.com/victorakor/face-recognition-live-demo" target="_blank" rel="noopener">Source</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage card">
+      <div class="viewport" id="viewport">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="overlay"></canvas>
+
+        <!-- Shown until the visitor grants camera access -->
+        <div class="gate" id="gate">
+          <div class="gate-inner">
+            <h1>See the model run on your own camera</h1>
+            <p>
+              This page asks your browser for camera access, then sends single frames to the
+              model for detection and identification. Nothing is recorded — each frame is
+              analysed in memory and thrown away.
+            </p>
+            <button class="btn primary lg" id="startBtn">Enable camera</button>
+            <p class="gate-alt">
+              Rather not? <button class="linkbtn" id="pickFileBtn">Analyse a photo instead</button>
+            </p>
+            <p class="gate-error" id="gateError" hidden></p>
+          </div>
+        </div>
+
+        <div class="viewport-badges">
+          <span class="badge live" id="liveBadge" hidden>● LIVE</span>
+          <span class="badge" id="threatBadge" hidden>threat: low</span>
+          <span class="badge" id="latencyBadge" hidden>— ms</span>
+          <span class="badge" id="fpsBadge" hidden>— fps</span>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button class="btn" id="toggleBtn" disabled>Pause</button>
+        <button class="btn" id="switchBtn" hidden>Switch camera</button>
+        <button class="btn" id="photoBtn">Analyse a photo</button>
+        <label class="switch-row">
+          <input type="checkbox" id="alertSound" />
+          <span>Alert tone on unrecognised face or weapon</span>
+        </label>
+        <div class="spacer"></div>
+        <label class="slider-row">
+          <span>Match threshold</span>
+          <input type="range" id="threshold" min="0.25" max="0.75" step="0.005"
+                 value="{{ '%.3f'|format(default_threshold) }}" />
+          <output id="thresholdOut">{{ '%.3f'|format(default_threshold) }}</output>
+        </label>
+      </div>
+      <p class="hint">
+        Lower threshold = stricter matching (fewer false accepts). The default
+        <code>{{ '%.3f'|format(default_threshold) }}</code> is the operating point chosen by
+        the ROC sweep during evaluation. <code>d</code> under each box is the raw embedding
+        distance to the closest enrolled face.
+      </p>
+    </section>
+
+    <section class="sidepanel">
+      <div class="card">
+        <h2>This frame</h2>
+        <div class="statgrid">
+          <div class="stat"><span class="stat-label">Faces</span><span class="stat-value" id="statFaces">0</span></div>
+          <div class="stat"><span class="stat-label">Recognised</span><span class="stat-value good" id="statKnown">0</span></div>
+          <div class="stat"><span class="stat-label">Unknown</span><span class="stat-value bad" id="statUnknown">0</span></div>
+          <div class="stat"><span class="stat-label">Covered</span><span class="stat-value warn" id="statCovered">0</span></div>
+          <div class="stat"><span class="stat-label">Weapons</span><span class="stat-value bad" id="statWeapons">0</span></div>
+          <div class="stat"><span class="stat-label">Inference</span><span class="stat-value" id="statLatency">—</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Enrolled identities <span class="count" id="galleryCount"></span></h2>
+        <div class="chips" id="identityChips"><span class="muted">loading…</span></div>
+        <p class="hint">
+          Anyone not in this gallery is reported as <strong>Unknown</strong>. That is the
+          intended behaviour — the system is built to flag unenrolled faces.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Detector classes</h2>
+        <div class="chips" id="classChips"><span class="muted">loading…</span></div>
+        <p class="hint">
+          The detector localises faces and labels how covered they are, and separately flags
+          weapons. A covered face still gets an identity attempt, but the embedding is much
+          less reliable — expect <strong>Unknown</strong>.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Recent detections</h2>
+        <ul class="log" id="log"><li class="muted">Nothing yet.</li></ul>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>How it works</h2>
+      <ol class="steps">
+        <li><strong>Capture</strong> — your browser grabs a frame from the webcam and encodes it as JPEG. The camera stream itself never leaves your device as video.</li>
+        <li><strong>Detect</strong> — custom-trained YOLOv8 weights locate every face and classify its covering (<code>no_mask</code>, <code>mask</code>, <code>other_coverings</code>), and flag any <code>weapon</code> in frame. If the YOLO runtime is unavailable the server falls back to dlib's HOG face detector.</li>
+        <li><strong>Describe</strong> — dlib's 68-point landmark predictor aligns each face, and the ResNet encoder maps it to a 128-dimension embedding.</li>
+        <li><strong>Match</strong> — the embedding is compared by euclidean distance against the enrolled gallery. Under the threshold it is a match; over it, the face is Unknown.</li>
+      </ol>
+      <p class="hint">
+        Everything runs on CPU on a free-tier container, so expect a couple of frames per
+        second rather than real-time video. Boxes fade while the next result is in flight.
+      </p>
+    </section>
+
+    <section class="card wide" id="metricsCard">
+      <h2>Evaluation</h2>
+      <div class="statgrid metrics">
+        <div class="stat"><span class="stat-label">ROC AUC</span><span class="stat-value" id="mAuc">—</span></div>
+        <div class="stat"><span class="stat-label">Recall</span><span class="stat-value" id="mRecall">—</span></div>
+        <div class="stat"><span class="stat-label">Precision</span><span class="stat-value" id="mPrecision">—</span></div>
+        <div class="stat"><span class="stat-label">F1</span><span class="stat-value" id="mF1">—</span></div>
+        <div class="stat"><span class="stat-label">Accuracy</span><span class="stat-value" id="mAccuracy">—</span></div>
+        <div class="stat"><span class="stat-label">Test samples</span><span class="stat-value" id="mSamples">—</span></div>
+      </div>
+      <p class="hint">
+        Verification metrics for the identification stage, measured on a held-out set of 55
+        samples. The chosen distance threshold is the point that maximises separation on the
+        ROC curve below.
+      </p>
+      <div class="figures">
+        <figure>
+          <img src="{{ url_for('static', filename='metrics/roc_curve.png') }}" alt="ROC curve for the face verification task" loading="lazy" />
+          <figcaption>ROC curve — threshold selection</figcaption>
+        </figure>
+        <figure>
+          <img src="{{ url_for('static', filename='metrics/distance_distributions.png') }}" alt="Embedding distance distributions for matching and non-matching pairs" loading="lazy" />
+          <figcaption>Embedding distance distributions</figcaption>
+        </figure>
+        <figure>
+          <img src="{{ url_for('static', filename='metrics/per_class_confusion_matrix.png') }}" alt="Per-class confusion matrix" loading="lazy" />
+          <figcaption>Per-class confusion matrix</figcaption>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Frames are processed in memory and never written to disk or forwarded anywhere. Camera
+      access stops the moment you pause or close the page.
+    </p>
+    <p>
+      This is a demonstration of a student research project, not a security product. Face
+      recognition makes mistakes — do not use it to make decisions about people.
+    </p>
+    <p class="warnings" id="warnings" hidden></p>
+  </footer>
+
+  <input type="file" id="fileInput" accept="image/*" hidden />
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

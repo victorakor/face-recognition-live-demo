@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local scratch: sample images and captured payloads used while testing the endpoint
+.testdata/
+
+# Stock dlib models. These are large (~120 MB combined) and unmodified upstream files, so
+# they are downloaded at build time by scripts/fetch_models.py rather than committed.
+models/*.dat
+models/*.dat.bz2
+
+# The project's own artifacts DO belong in the repo -- the YOLO weights and the face
+# gallery are what make this demo the demo.
+!models/best.pt
+!models/known_faces.pkl
+
+# Secrets. Nothing in this app needs a credential, but keep the door shut.
+.env
+.env.*
+*.pem
+serviceAccountKey.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Build output
+build/
+dist/
+*.log

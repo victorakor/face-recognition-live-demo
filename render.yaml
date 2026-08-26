@@ -1,0 +1,28 @@
+# Render blueprint. Deploy with: Render dashboard -> New -> Blueprint, pointed at this repo.
+#
+# The free plan gives 512 MB of RAM, which is tight for torch + dlib + YOLO (~600-800 MB
+# resident). If the service gets OOM-killed, flip ENABLE_YOLO to "0" below: that skips the
+# torch import entirely and falls back to dlib's HOG face detector, dropping the resident set
+# to ~300 MB at the cost of the covering and weapon classes.
+services:
+  - type: web
+    name: face-recognition-live-demo
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Answers immediately without forcing a model load, so the container is not killed while
+    # the ~130 MB of weights are still coming up.
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Render injects PORT itself; the Dockerfile's CMD reads it.
+      - key: ENABLE_YOLO
+        value: "1"
+      - key: YOLO_IMGSZ
+        value: "480"
+      - key: TORCH_THREADS
+        value: "1"
+      - key: MAX_IN_FLIGHT
+        value: "2"

@@ -1,0 +1,35 @@
+# Keep the build context small: it is uploaded to the builder on every deploy.
+
+.git
+.gitignore
+.github
+
+# Local virtualenv and caches -- the image installs its own dependencies.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Test scratch
+.testdata/
+
+# Stock dlib models: fetched inside the image by scripts/fetch_models.py, so shipping the
+# local copies would add ~120 MB to every context upload for nothing.
+models/*.dat
+models/*.dat.bz2
+
+# Docs and figures are served by the app, so static/ stays -- but the raw report and any
+# deploy manifests are not needed at runtime.
+render.yaml
+deploy/
+
+.env
+.env.*
+serviceAccountKey.json
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

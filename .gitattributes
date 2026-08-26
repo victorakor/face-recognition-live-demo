@@ -1,0 +1,11 @@
+# Normalise text to LF in the repo. Without this, a Windows clone can hand the Docker
+# builder a CRLF Dockerfile / CMD string, which breaks in the Linux container.
+* text=auto eol=lf
+
+# Binary artifacts: never touch these.
+*.pt      binary
+*.pkl     binary
+*.dat     binary
+*.png     binary
+*.jpg     binary
+*.bz2     binary

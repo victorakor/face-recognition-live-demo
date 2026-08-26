@@ -1,0 +1,23 @@
+# Web
+Flask==3.0.3
+gunicorn==22.0.0
+
+# Numerics and imaging. numpy is held at 1.26.x: torch 2.4.1 is built against the NumPy 1
+# ABI, and opencv/dlib in this pinset expect the same.
+numpy==1.26.4
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
+
+# Detection (YOLOv8). ultralytics depends on the GUI build of opencv, so the Dockerfile
+# reinstalls the headless build afterwards to keep it out of the image.
+torch==2.4.1
+torchvision==0.19.1
+ultralytics==8.3.40
+
+# Face landmarks + 128-d embeddings.
+#
+# dlib-bin is a prebuilt wheel, so a local checkout needs no compiler. It is built without
+# BLAS though, which makes the ResNet encoder roughly 20x slower (~1.5 s per face instead
+# of ~80 ms). The Dockerfile replaces it with dlib compiled against OpenBLAS; the app
+# reports which one it ended up with under "Model notes" on the page.
+dlib-bin==19.24.6
