@@ -156,7 +156,7 @@ curl -s -X POST --data-binary @face.jpg \
     "confidence": 0.812
   }],
   "objects": [],
-  "detector": "yolov8-custom",
+  "detector": "yolov8-onnx",
   "threat": "low",
   "threshold": 0.402,
   "frame": {"width": 960, "height": 720},
@@ -239,10 +239,14 @@ Measured on the live free instance (0.1 CPU), which is the honest performance pi
 
 | | Value |
 | --- | --- |
-| Detection | 464–531 ms |
-| Recognition (1 face) | 198–203 ms |
-| Total per frame | ~670 ms (≈1.5 fps) |
+| Detection | 464–592 ms |
+| Recognition (1 face) | 198–396 ms |
+| Total per frame | 670–990 ms (≈1–1.5 fps) |
 | `blas` | `true` — the source build worked |
+
+The spread is real: 0.1 CPU is a shared-core allocation, so the same request is ~40% slower
+when a neighbour is busy or the container has just started. Expect the low end warm and the
+high end for the first few frames after a wake-up.
 
 Recognition at ~200 ms rather than ~1000 ms is the entire payoff of compiling dlib against
 OpenBLAS. Detection results are identical to local, down to the distance (0.3074).
