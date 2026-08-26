@@ -39,8 +39,16 @@ RUN pip install -r requirements.txt
 
 # The dlib-bin wheel from requirements.txt ships without BLAS, which makes the ResNet face
 # encoder ~20x slower. Compiling dlib here picks up OpenBLAS and takes encoding from ~1.5 s
-# down to ~80 ms per face. If the build fails we fall back to the wheel rather than failing
-# the deploy -- the app detects the difference and says so on the page.
+# down to ~80 ms per face.
+#
+# CMAKE_BUILD_PARALLEL_LEVEL is not optional. dlib's setup.py sizes its own -j by reading
+# SC_PHYS_PAGES, which reports the *host* machine's RAM rather than the build container's
+# cgroup limit -- so on a big builder it fans out to more g++ processes than the container is
+# allowed and the whole build gets OOM-killed. At ~2 GB per process, 2 is the safe number.
+#
+# If the build fails anyway we fall back to the wheel rather than failing the deploy; the app
+# detects the difference and says so on the page.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2
 RUN pip uninstall -y dlib-bin dlib || true; \
     if pip install --no-binary :all: "dlib==19.24.6"; then \
       echo ">>> dlib compiled from source"; \
