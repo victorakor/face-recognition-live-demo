@@ -7,14 +7,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Keep CPU inference from oversubscribing a 2-vCPU container.
+# Keep CPU inference from oversubscribing a small container.
 ENV OMP_NUM_THREADS=2
 ENV OPENBLAS_NUM_THREADS=2
 ENV MKL_NUM_THREADS=2
 ENV TORCH_THREADS=2
 
-# ultralytics and matplotlib both insist on a writable config directory.
-ENV YOLO_CONFIG_DIR=/tmp/ultralytics
+# matplotlib is pulled in transitively and insists on a writable config directory.
 ENV MPLCONFIGDIR=/tmp/matplotlib
 
 ENV PORT=7860
@@ -35,17 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# torch from the CPU-only index: the default PyPI Linux wheels bundle CUDA and are ~2.5 GB.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu \
-      torch==2.4.1 torchvision==0.19.1
-
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
-
-# ultralytics pulls in opencv-python (the GUI build). Same cv2 API, but it needs X11 libs at
-# import, so make sure the headless build is the one left standing.
-RUN pip uninstall -y opencv-python opencv-contrib-python || true \
- && pip install --force-reinstall --no-deps opencv-python-headless==4.10.0.84
 
 # The dlib-bin wheel from requirements.txt ships without BLAS, which makes the ResNet face
 # encoder ~20x slower. Compiling dlib here picks up OpenBLAS and takes encoding from ~1.5 s
@@ -61,16 +51,15 @@ RUN pip uninstall -y dlib-bin dlib || true; \
 RUN python -c "import dlib; print('>>> dlib', dlib.__version__, 'BLAS', dlib.DLIB_USE_BLAS, 'LAPACK', dlib.DLIB_USE_LAPACK)"
 
 # The two stock dlib models are ~120 MB uncompressed, so they are fetched here rather than
-# committed. The custom pieces (YOLO weights, face gallery) come from the repo in the COPY
-# below.
+# committed. The custom pieces (the ONNX detector and the face gallery) come from the repo in
+# the COPY below.
 COPY scripts/ ./scripts/
 RUN python scripts/fetch_models.py --models-dir /app/models
 
 COPY . .
 
-# Load every model once at build time. This turns "YOLO silently fell back to dlib in
-# production" into a line in the build log, and bakes any asset ultralytics fetches on first
-# use into the image instead of the container's first request.
+# Load every model once at build time. This turns "the ONNX detector silently fell back to
+# dlib HOG in production" into a line in the build log rather than a surprise on the page.
 RUN python -c "from recognizer import get_recognizer; print('>>> self-check:', get_recognizer().info())" \
     || echo ">>> WARNING: model self-check failed" >&2
 

@@ -1,0 +1,14 @@
+# Not needed to run the app -- only to regenerate models/best.onnx from models/best.pt.
+#
+#   pip install -r requirements-export.txt
+#   python scripts/export_onnx.py
+#
+# torch is the reason these are separate: it is ~400 MB resident and several GB installed,
+# and the server does not import it.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch==2.4.1
+torchvision==0.19.1
+ultralytics==8.3.40
+onnx==1.16.2

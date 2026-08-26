@@ -5,10 +5,9 @@ once, and `FaceRecognizer.detect()` is called with one frame at a time. Neither 
 the ultralytics predictor is thread-safe, so inference is serialised behind a lock.
 
 Pipeline
-    1. Detect -- custom YOLOv8 weights (models/best.pt) locate faces and classify their
-       covering (no_mask / mask / other_coverings) plus any weapon in frame. Without the
-       YOLO runtime the server falls back to dlib's HOG face detector, which finds faces
-       but cannot classify coverings or weapons.
+    1. Detect -- custom YOLOv8 weights locate faces and classify their covering
+       (no_mask / mask / other_coverings) plus any weapon in frame. See detector.py for the
+       backends; the deployed one is ONNX.
     2. Describe -- dlib's 68-point landmark predictor aligns each face and the ResNet
        encoder maps it to a 128-d embedding.
     3. Match -- nearest neighbour (euclidean) against the gallery in
@@ -29,12 +28,15 @@ import cv2
 import dlib
 import numpy as np
 
+from detector import HogDetector, build_detector
+
 # --------------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------------
 
 MODELS_DIR = os.getenv("MODELS_DIR", "models")
 
+YOLO_ONNX_PATH = os.getenv("YOLO_ONNX_PATH", os.path.join(MODELS_DIR, "best.onnx"))
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", os.path.join(MODELS_DIR, "best.pt"))
 DLIB_LANDMARK_PATH = os.getenv(
     "DLIB_LANDMARK", os.path.join(MODELS_DIR, "shape_predictor_68_face_landmarks.dat")
@@ -47,13 +49,17 @@ KNOWN_FACES_PATH = os.getenv("KNOWN_FACES_PKL", os.path.join(MODELS_DIR, "known_
 # Distance threshold picked by the ROC sweep in docs/evaluation_report.txt.
 DEFAULT_THRESHOLD = float(os.getenv("BEST_THRESHOLD", "0.402"))
 
-# YOLO costs ~400 MB resident once torch is imported. Hosts with a small memory cap can
-# set ENABLE_YOLO=0 to run the dlib-only pipeline instead.
-ENABLE_YOLO = os.getenv("ENABLE_YOLO", "1").lower() not in ("0", "false", "no")
-# 480 is the sweet spot on a 2-vCPU container: ~0.5s per frame with no measurable drop in
-# detection confidence versus 640.
+# "auto" prefers ONNX, then torch, then dlib HOG. Force one with "onnx", "torch" or "hog".
+# ENABLE_YOLO=0 is kept as a shorthand for "hog" -- it is the escape hatch for a host too
+# small to load the detector at all.
+DETECTOR_PREFERENCE = os.getenv("DETECTOR", "auto").strip().lower()
+if os.getenv("ENABLE_YOLO", "1").lower() in ("0", "false", "no"):
+    DETECTOR_PREFERENCE = "hog"
+
+# Only used by the torch backend; the ONNX export has its input size baked in (480).
 YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "480"))
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
+TORCH_THREADS = int(os.getenv("TORCH_THREADS", "2"))
 
 # Guardrails so one busy frame cannot pin the CPU for seconds. Embedding a face is the
 # expensive step, so the face cap is tighter than the object cap.
@@ -61,8 +67,8 @@ MAX_FACES = int(os.getenv("MAX_FACES", "4"))
 MAX_OBJECTS = int(os.getenv("MAX_OBJECTS", "8"))
 MAX_FRAME_WIDTH = int(os.getenv("MAX_FRAME_WIDTH", "960"))
 
-# Classes from models/best.pt that are faces (and therefore worth identifying). Anything
-# else the detector reports -- currently just "weapon" -- is surfaced as a scene object.
+# Classes from the detector that are faces (and therefore worth identifying). Anything else
+# it reports -- currently just "weapon" -- is surfaced as a scene object.
 FACE_CLASSES = {"no_mask", "mask", "other_coverings", "face"}
 
 # How each face class is described in the UI, and whether the covering makes identity
@@ -101,9 +107,9 @@ class FaceRecognizer:
         self.warnings: list[str] = []
 
         self.detector_backend = "none"
-        self.yolo = None
-        self.yolo_classes: list[str] = []
-        self.hog_detector = None
+        self.detector = None
+        self.detector_classes: list[str] = []
+        self.hog_detector: HogDetector | None = None
         self.shape_predictor = None
         self.face_encoder = None
 
@@ -112,12 +118,12 @@ class FaceRecognizer:
         self.identities: list[str] = []
 
         self._load_dlib()
-        self._load_yolo()
+        self._load_detector()
         self._load_gallery()
 
     # ---------------------------------------------------------------- loading
     def _load_dlib(self) -> None:
-        self.hog_detector = dlib.get_frontal_face_detector()
+        self.hog_detector = HogDetector()
 
         if os.path.exists(DLIB_LANDMARK_PATH):
             self.shape_predictor = dlib.shape_predictor(DLIB_LANDMARK_PATH)
@@ -131,55 +137,28 @@ class FaceRecognizer:
 
         if not getattr(dlib, "DLIB_USE_BLAS", False):
             # Without BLAS, dlib's ResNet forward pass falls back to a naive matmul and
-            # takes ~2s per face instead of ~80ms. The Dockerfile builds dlib against
+            # takes ~1.5s per face instead of ~80ms. The Dockerfile builds dlib against
             # OpenBLAS for exactly this reason.
             self.warnings.append("dlib built without BLAS: face encoding will be slow")
 
-        self.detector_backend = "dlib-hog"
+    def _load_detector(self) -> None:
+        self.detector, warnings = build_detector(
+            onnx_path=YOLO_ONNX_PATH,
+            torch_path=YOLO_MODEL_PATH,
+            imgsz=YOLO_IMGSZ,
+            conf=YOLO_CONF,
+            threads=TORCH_THREADS,
+            preference=DETECTOR_PREFERENCE,
+        )
+        self.warnings.extend(warnings)
+        self.detector_backend = self.detector.name
+        self.detector_classes = list(self.detector.classes)
 
-    def _load_yolo(self) -> None:
-        if not ENABLE_YOLO:
-            self.warnings.append("YOLO disabled via ENABLE_YOLO=0; using dlib HOG detector")
-            return
-        if not os.path.exists(YOLO_MODEL_PATH):
-            self.warnings.append(f"YOLO weights not found at {YOLO_MODEL_PATH}")
-            return
-
+        # Warm the graph so the first visitor does not pay for the first allocation.
         try:
-            import torch
-            from ultralytics import YOLO
-
-            # Keep CPU inference from oversubscribing the (usually tiny) container.
-            torch.set_num_threads(int(os.getenv("TORCH_THREADS", "2")))
-
-            # torch>=2.6 flipped torch.load to weights_only=True, which refuses to unpickle
-            # an ultralytics checkpoint. These are our own weights, shipped in this repo,
-            # so loading them fully is safe.
-            original_load = torch.load
-
-            def _permissive_load(*args: Any, **kwargs: Any):
-                kwargs.setdefault("weights_only", False)
-                return original_load(*args, **kwargs)
-
-            torch.load = _permissive_load
-            try:
-                self.yolo = YOLO(YOLO_MODEL_PATH)
-                # Warm the graph up so the first visitor does not eat the cold start.
-                self.yolo.predict(
-                    source=np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8),
-                    imgsz=YOLO_IMGSZ,
-                    conf=YOLO_CONF,
-                    verbose=False,
-                )
-            finally:
-                torch.load = original_load
-
-            names = self.yolo.names or {}
-            self.yolo_classes = [str(names[key]) for key in sorted(names)]
-            self.detector_backend = "yolov8-custom"
-        except Exception as exc:  # pragma: no cover - depends on host wheels
-            self.yolo = None
-            self.warnings.append(f"YOLO unavailable ({exc}); using dlib HOG detector")
+            self.detector(np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8))
+        except Exception as exc:  # pragma: no cover - a broken backend is worth reporting
+            self.warnings.append(f"detector warm-up failed ({exc})")
 
     def _load_gallery(self) -> None:
         if not os.path.exists(KNOWN_FACES_PATH):
@@ -211,7 +190,7 @@ class FaceRecognizer:
     def info(self) -> dict[str, Any]:
         return {
             "detector": self.detector_backend,
-            "detectorClasses": self.yolo_classes,
+            "detectorClasses": self.detector_classes,
             "recognitionReady": self.recognition_ready,
             "identities": self.identities,
             "gallerySize": int(len(self.known_labels)),
@@ -301,47 +280,41 @@ class FaceRecognizer:
         faces: list[dict[str, Any]] = []
         objects: list[dict[str, Any]] = []
 
-        if self.yolo is not None:
-            try:
-                results = self.yolo.predict(
-                    source=frame_bgr, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, verbose=False
-                )
-                for result in results:
-                    names = result.names or {}
-                    for box in result.boxes:
-                        raw = tuple(int(v) for v in box.xyxy[0].tolist())
-                        clipped = self._clip(raw, width, height)
-                        if clipped is None:
-                            continue
-                        label = str(names.get(int(box.cls[0]), "object"))
-                        score = float(box.conf[0])
-                        if label in FACE_CLASSES:
-                            faces.append({"box": list(clipped), "cls": label, "detectScore": score})
-                        else:
-                            objects.append({"box": list(clipped), "label": label, "score": round(score, 3)})
-            except Exception:
-                faces, objects = [], []
+        try:
+            detections = self.detector(frame_bgr)
+        except Exception:
+            detections = []
 
-        if not faces and self.hog_detector is not None:
-            # HOG is slow at full resolution; a half-size pass is plenty for webcam framing
-            # and roughly 4x cheaper.
-            scale = 2 if width > 480 else 1
-            small = frame_bgr if scale == 1 else cv2.resize(frame_bgr, (width // 2, height // 2))
-            for rect in self.hog_detector(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), 0):
-                raw = (
-                    rect.left() * scale,
-                    rect.top() * scale,
-                    rect.right() * scale,
-                    rect.bottom() * scale,
+        for detection in detections:
+            clipped = self._clip(detection.box, width, height)
+            if clipped is None:
+                continue
+            if detection.label in FACE_CLASSES:
+                faces.append(
+                    {"box": list(clipped), "cls": detection.label, "detectScore": detection.score}
                 )
-                clipped = self._clip(raw, width, height)
+            else:
+                objects.append(
+                    {
+                        "box": list(clipped),
+                        "label": detection.label,
+                        "score": round(detection.score, 3) if detection.score is not None else None,
+                    }
+                )
+
+        # The weights were trained on covered faces, so a plain uncovered face at an odd
+        # angle is the case they most often miss. HOG is cheap enough to be worth a second
+        # pass when the detector came back with nothing.
+        if not faces and self.hog_detector is not None and not isinstance(self.detector, HogDetector):
+            for detection in self.hog_detector(frame_bgr):
+                clipped = self._clip(detection.box, width, height)
                 if clipped is not None:
                     faces.append({"box": list(clipped), "cls": "face", "detectScore": None})
 
         # Largest first, so the caps drop background bystanders rather than whoever is
         # actually standing in front of the camera.
         faces.sort(key=lambda item: _area(tuple(item["box"])), reverse=True)
-        objects.sort(key=lambda item: item["score"], reverse=True)
+        objects.sort(key=lambda item: item["score"] or 0.0, reverse=True)
         return faces[:MAX_FACES], objects[:MAX_OBJECTS]
 
     @staticmethod

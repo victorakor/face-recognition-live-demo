@@ -33,3 +33,12 @@ licence above and are not redistributed here:
   dlib_face_recognition_resnet_model_v1.dat
       CC0 / public domain, per its author.
       https://github.com/davisking/dlib-models
+
+The detector weights (models/best.pt, models/best.onnx) were trained with
+Ultralytics YOLOv8, which is AGPL-3.0. Ultralytics takes the position that this
+extends to models trained with it and to software that serves them. That reading
+is contested and this note is not legal advice, but if you intend to use these
+weights commercially, resolve it first -- either by obtaining an Ultralytics
+Enterprise licence or by retraining the detector on a permissively licensed
+implementation. Nothing about the MIT grant above changes the terms attached to
+the weights.

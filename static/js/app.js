@@ -69,7 +69,8 @@
       const { model, evaluation } = payload;
 
       const label = {
-        'yolov8-custom': 'YOLOv8 (custom) + dlib ResNet',
+        'yolov8-onnx': 'YOLOv8 (ONNX) + dlib ResNet',
+        'yolov8-torch': 'YOLOv8 (torch) + dlib ResNet',
         'dlib-hog': 'dlib HOG + dlib ResNet',
       }[model.detector] || model.detector;
       const pill = el('backendPill');

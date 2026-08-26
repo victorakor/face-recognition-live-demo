@@ -4,8 +4,8 @@ A browser demo of a two-stage vision pipeline: custom YOLOv8 weights find faces,
 what is covering them, and flag weapons; dlib's ResNet encoder then turns each face into a
 128-d embedding and matches it against an enrolled gallery.
 
-**Live:** [Hugging Face Space](https://huggingface.co/spaces/victorakor/face-recognition-live-demo)
-· **Source:** [github.com/victorakor/face-recognition-live-demo](https://github.com/victorakor/face-recognition-live-demo)
+**Source:** [github.com/victorakor/face-recognition-live-demo](https://github.com/victorakor/face-recognition-live-demo)
+· **Live:** see [Deployment](#deployment)
 
 No accounts, no login, no database. Open the page, allow the camera, and the model runs on
 your own webcam feed. If you would rather not turn a camera on, there is a photo-upload
@@ -56,7 +56,7 @@ Details worth knowing:
 
 | Stage | Model | Notes |
 | --- | --- | --- |
-| Detection | YOLOv8, custom weights (`models/best.pt`) | Classes: `no_mask`, `mask`, `other_coverings`, `weapon` |
+| Detection | YOLOv8, custom weights (`models/best.onnx`) | Classes: `no_mask`, `mask`, `other_coverings`, `weapon` |
 | Alignment | `shape_predictor_68_face_landmarks.dat` | Stock dlib, fetched at build time |
 | Embedding | `dlib_face_recognition_resnet_model_v1.dat` | Stock dlib, 128-d output |
 | Matching | Nearest neighbour, euclidean | Accept below the evaluated threshold |
@@ -64,6 +64,40 @@ Details worth knowing:
 Only the face classes are sent through recognition. A `weapon` box is a scene object, not a
 face — running an identity match on one would be meaningless, so the pipeline keeps the two
 lists separate and lets weapons drive the threat level instead.
+
+The gallery holds 239 embeddings across 5 enrolled identities.
+
+### Why ONNX instead of torch
+
+`models/best.pt` is the trained checkpoint, and it is in the repo. But the server runs
+`models/best.onnx` through onnxruntime instead, because importing torch + ultralytics costs
+~400 MB resident and the free-tier target has 512 MB total. Measured, whole process:
+
+| | torch + ultralytics | onnxruntime |
+| --- | --- | --- |
+| Resident memory | 600–800 MB | **224 MB** |
+| Detection latency | 230–260 ms | **128–160 ms** |
+| Cold start | ~46 s | **~25 s** |
+
+Output is equivalent — same classes, boxes within a pixel, same identity decisions:
+
+```
+                  ONNX                                torch
+barack.jpg  no_mask [378,141,607,415] 0.899     no_mask [379,142,608,414] 0.888
+            -> Barack  d=0.3074                 -> Barack  d=0.3154
+lena.jpg    face    [234,234,378,378]           face    [234,234,378,378]
+            -> Unknown d=0.7663                 -> Unknown d=0.7663
+```
+
+The sub-pixel and score differences are onnxruntime's graph fusion reordering float ops, not
+a logic difference. The trade is that [`detector.py`](detector.py) has to do the letterboxing
+and non-maximum suppression ultralytics would otherwise do — it mirrors ultralytics' own
+padding arithmetic, including the `round(pad - 0.1)`, because getting that wrong shifts every
+box.
+
+The torch path is still in the code (`DETECTOR=torch`) if you install
+[`requirements-export.txt`](requirements-export.txt). Regenerate the ONNX graph after
+retraining with `python scripts/export_onnx.py`.
 
 ### Evaluation
 
@@ -167,13 +201,16 @@ failing the deploy, and the app says which one it got under "Model notes" on the
 | --- | --- | --- |
 | `PORT` | `7860` | Bind port |
 | `BEST_THRESHOLD` | `0.402` | Default match threshold |
-| `ENABLE_YOLO` | `1` | `0` drops torch entirely and uses dlib's HOG detector — much less memory, but no covering or weapon classes |
-| `YOLO_IMGSZ` | `480` | Detector input size. 640 is ~5x slower here for no measurable confidence gain |
+| `DETECTOR` | `auto` | `onnx`, `torch` or `hog` to force a backend. `auto` prefers ONNX, then torch, then HOG |
+| `ENABLE_YOLO` | `1` | `0` is shorthand for `DETECTOR=hog` — smallest possible footprint, but no covering or weapon classes |
 | `YOLO_CONF` | `0.35` | Detection confidence floor |
+| `YOLO_IOU` | `0.7` | NMS IoU threshold (ultralytics' predict default) |
+| `YOLO_IMGSZ` | `480` | Torch-backend input size only; the ONNX graph has 480 baked in at export |
 | `MAX_FACES` | `4` | Faces embedded per frame |
+| `MAX_OBJECTS` | `8` | Non-face detections returned per frame |
 | `MAX_FRAME_WIDTH` | `960` | Frames wider than this are downscaled before inference |
 | `MAX_IN_FLIGHT` | `3` | Concurrent detections before 503 |
-| `TORCH_THREADS` | `2` | Keeps CPU inference from oversubscribing a small container |
+| `TORCH_THREADS` | `2` | Inference thread count (applies to onnxruntime too, despite the name) |
 
 ## Enrolling your own faces
 
@@ -190,17 +227,26 @@ match the ones this gallery was built from.
 
 ## Deployment
 
-Both targets build the same `Dockerfile`:
+`render.yaml` is a Docker blueprint — point Render at this repo (New → Blueprint) and it
+builds and deploys. The whole stack fits the 512 MB free instance because of the ONNX swap
+above; nothing needs disabling.
 
-- **Hugging Face Spaces** — `sdk: docker`, `app_port: 7860`. The generous memory ceiling on
-  the free tier is what makes the full torch + dlib + YOLO stack viable.
-- **Render** — Docker runtime, see [`render.yaml`](render.yaml). The 512 MB free tier is
-  tight for this stack; if it gets OOM-killed, set `ENABLE_YOLO=0` to trade the covering and
-  weapon classes for a much smaller resident set.
+Cold start is roughly 25–40 s while ~130 MB of weights load, and the free instance also spins
+down after 15 minutes idle, so the first request after a quiet period pays that again. The
+page polls `/api/info` and shows "warming up the model…" until the models are up, while
+`/api/health` answers immediately throughout so the platform health check can't kill the
+container mid-load.
 
-Cold start is roughly a minute while ~130 MB of weights load. The page polls `/api/info` and
-shows "warming up the model…" until they are up, and `/api/health` answers immediately
-throughout so platform health checks don't kill the container mid-load.
+**Hugging Face Spaces no longer works on the free tier** for this app. As of 2026, Docker and
+Gradio Spaces on free `cpu-basic` require a PRO subscription — the API refuses the create call
+outright:
+
+> Static Spaces are free for everyone, but hosting Gradio and Docker Spaces on free cpu-basic
+> requires a PRO subscription.
+
+The Space files are ready if you do have PRO: push this repo to a Docker Space and replace
+`README.md` with [`deploy/README.space.md`](deploy/README.space.md), which carries the
+`sdk: docker` / `app_port: 7860` frontmatter the platform needs.
 
 ## Limitations
 
@@ -217,6 +263,6 @@ This is a demonstration, not a security product.
 
 ## Licence
 
-Code is MIT. The two stock dlib models are redistributed under their own upstream terms; the
-face-landmark predictor in particular is licensed for research use, which is why it is
-fetched at build time rather than vendored here.
+Code is MIT — see [`LICENSE`](LICENSE), which also covers the two stock dlib models (fetched
+at build time rather than vendored, and under their own upstream terms) and the AGPL question
+that comes with ultralytics-trained weights.
