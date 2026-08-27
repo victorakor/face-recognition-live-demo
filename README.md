@@ -74,8 +74,14 @@ that difference buys real accuracy.
 | Detector input | 640 | 640 |
 | Confidence floor | 0.35 | 0.25 |
 | HOG fallback | yes | **no** |
-| Measured latency | 1000–1900 ms | **124–160 ms** |
+| Latency, local (no BLAS) | 1000–1900 ms | **124–160 ms** |
+| Latency, live free tier | 714–1201 ms | **631–788 ms** |
 | Threat escalates on | weapon, or unrecognised face | weapon, or covered face |
+
+Recognition mode is *slower* locally than on the free tier because a pip checkout gets the
+`dlib-bin` wheel, which is built without BLAS — see
+[A note on dlib and BLAS](#a-note-on-dlib-and-blas). Detection mode never touches dlib, so it
+is unaffected, and the gap between the two modes is correspondingly enormous locally.
 
 Recognition mode reports a name, a distance and a match score per face. Detection mode
 reports the detector's own class and confidence and nothing else — no embedding, no gallery
@@ -143,16 +149,20 @@ The gallery holds 239 embeddings across 5 enrolled identities.
 
 | | torch + ultralytics | onnxruntime |
 | --- | --- | --- |
-| Resident memory | 600–800 MB | **224 MB** |
+| Resident memory | 600–800 MB | **223 MB** |
 | Detection latency | 230–260 ms | **128–160 ms** |
 | Cold start | ~46 s | **~25 s** |
+
+Measured locally, whole process. The onnxruntime column is at `imgsz` 640; the torch column
+was measured at 480, so if anything the comparison flatters torch — ONNX is faster while doing
+1.8× the work.
 
 Output is equivalent — same classes, boxes within a pixel, same identity decisions:
 
 ```
                   ONNX                                torch
 barack.jpg  no_mask [378,141,607,415] 0.899     no_mask [379,142,608,414] 0.888
-            -> Barack  d=0.3074                 -> Barack  d=0.3154
+            -> Barack  d=0.3164                 -> Barack  d=0.3154
 lena.jpg    face    [234,234,378,378]           face    [234,234,378,378]
             -> Unknown d=0.7663                 -> Unknown d=0.7663
 ```
@@ -325,21 +335,28 @@ match the ones this gallery was built from.
 builds and deploys. The whole stack fits the 512 MB free instance because of the ONNX swap
 above; nothing needs disabling. The build takes ~6 minutes, almost all of it compiling dlib.
 
-Measured on the live free instance (0.1 CPU), which is the honest performance picture:
+Measured on the live free instance (0.1 CPU), which is the honest performance picture. Three
+passes over three images per mode, `imgsz` 640:
 
-| | Value |
-| --- | --- |
-| Detection | 464–592 ms |
-| Recognition (1 face) | 198–396 ms |
-| Total per frame | 670–990 ms (≈1–1.5 fps) |
-| `blas` | `true` — the source build worked |
+| | Recognise faces | Detect masks & weapons |
+| --- | --- | --- |
+| Detection | 630–886 ms | 631–788 ms |
+| Recognition (1 face) | 0–400 ms | — (skipped) |
+| Total per frame | 714–1201 ms (≈0.8–1.4 fps) | **631–788 ms (≈1.3–1.6 fps)** |
+| `blas` | `true` — the source build worked | `true` |
 
 The spread is real: 0.1 CPU is a shared-core allocation, so the same request is ~40% slower
 when a neighbour is busy or the container has just started. Expect the low end warm and the
-high end for the first few frames after a wake-up.
+high end for the first few frames after a wake-up. Add roughly 700–1900 ms of round-trip on
+top for the network hop from a home connection.
 
-Recognition at ~200 ms rather than ~1000 ms is the entire payoff of compiling dlib against
-OpenBLAS. Detection results are identical to local, down to the distance (0.3074).
+Detection is slower than it was at `imgsz` 480 (464–592 ms) because 640 is 1.8× the pixels —
+that is the cost of the recall the [resolution change](#serving-resolution) bought back.
+Detection mode absorbs it by skipping the embedding entirely, which is why it ends up the
+faster of the two despite the bigger input.
+
+Recognition at ~200–400 ms rather than ~1000 ms is the entire payoff of compiling dlib against
+OpenBLAS. Detection results are identical to local, down to the distance (0.3164).
 
 Cold start is 25–40 s while ~130 MB of weights load, and the free instance spins down after 15
 minutes idle, so the first request after a quiet period pays that again. The page polls
