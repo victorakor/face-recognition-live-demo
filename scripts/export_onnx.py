@@ -5,7 +5,12 @@ The server runs the ONNX graph, so this only needs running when the YOLO weights
     pip install -r requirements-export.txt
     python scripts/export_onnx.py
 
-The exported input size is baked into the graph, so keep it in step with YOLO_IMGSZ (480).
+Exported with dynamic height/width so one graph serves both pipeline modes at whatever
+input size each asks for -- see detector.py. `--imgsz` only sets the shape used to trace the
+export; it is not baked in. Keep --dynamic on unless you have a reason not to: measured on
+the deployment container the dynamic graph is *faster* than a fixed-shape one at the same
+size (127 ms vs 144 ms at 640), so there is nothing to trade away.
+
 Class names ride along in the ONNX metadata, which is where detector.py reads them from --
 there is no hardcoded class list to keep in sync.
 """
@@ -18,15 +23,30 @@ import sys
 from typing import Any
 
 DEFAULT_WEIGHTS = os.path.join("models", "best.pt")
-DEFAULT_IMGSZ = 480
+# The size the weights were trained at, and what the server serves them at. Below this the
+# detector loses covered faces badly: on a 640x360 frame with a 180 px subject, `no_mask`
+# scores 0.86 at 640 and 0.06 at 480 -- a miss.
+DEFAULT_IMGSZ = 640
 DEFAULT_OPSET = 12
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", default=DEFAULT_WEIGHTS)
-    parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=DEFAULT_IMGSZ,
+        help="tracing size; with --dynamic (the default) the graph accepts any multiple of 32",
+    )
     parser.add_argument("--opset", type=int, default=DEFAULT_OPSET)
+    parser.add_argument(
+        "--no-dynamic",
+        dest="dynamic",
+        action="store_false",
+        help="bake imgsz into the graph (detector.py will then ignore per-mode sizes)",
+    )
+    parser.set_defaults(dynamic=True)
     args = parser.parse_args()
 
     if not os.path.exists(args.weights):
@@ -57,14 +77,15 @@ def main() -> int:
             imgsz=args.imgsz,
             opset=args.opset,
             simplify=False,
-            dynamic=False,
+            dynamic=args.dynamic,
             half=False,
         )
     finally:
         torch.load = original_load
 
     size_mb = os.path.getsize(path) / (1024 * 1024)
-    print(f"[ok] {path} ({size_mb:.1f} MB), input {args.imgsz}x{args.imgsz}, opset {args.opset}")
+    shape = "dynamic HxW" if args.dynamic else f"fixed {args.imgsz}x{args.imgsz}"
+    print(f"[ok] {path} ({size_mb:.1f} MB), input {shape}, traced at {args.imgsz}, opset {args.opset}")
     return 0
 
 

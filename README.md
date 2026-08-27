@@ -15,6 +15,10 @@ No accounts, no login, no database. Open the page, allow the camera, and the mod
 your own webcam feed. If you would rather not turn a camera on, there is a photo-upload
 fallback that runs the identical pipeline on a still image.
 
+A switch on the page picks which of the two pipelines runs on each frame — **Recognise
+faces** (who is this?) or **Detect masks & weapons** (what is in frame?). See
+[Two modes](#two-modes).
+
 ---
 
 ## How it works
@@ -31,10 +35,11 @@ getUserMedia()  ──▶ <video>
        ├─▶ offscreen canvas, 640 px wide
        │        └─▶ JPEG (q=0.72)  ──── POST /api/detect ───▶  decode
        │                                                        │
-       │                                                   YOLOv8 (imgsz 480)
-       │                                                        ├─ faces ─▶ dlib landmarks
-       │                                                        │            └─▶ 128-d embedding
-       │                                                        │                 └─▶ nearest neighbour
+       │                                                   YOLOv8 (imgsz 640)
+       │                                                        ├─ faces ─┬─ mode=detection ─▶ class + score, done
+       │                                                        │         └─ mode=recognition ─▶ dlib landmarks
+       │                                                        │                                └─▶ 128-d embedding
+       │                                                        │                                     └─▶ nearest neighbour
        │                                                        └─ weapons ─▶ threat level
        │                                                        │
        ◀──────────── JSON: boxes (normalised 0..1), names, distances, timings
@@ -56,6 +61,64 @@ Details worth knowing:
   people expect of a selfie view, and the drawing code flips the x coordinates to match. The
   model always sees the un-mirrored frame.
 
+## Two modes
+
+Both modes run the same detector on the same frame. They differ in what happens next, and
+that difference buys real accuracy.
+
+| | Recognise faces | Detect masks & weapons |
+| --- | --- | --- |
+| `mode` | `recognition` (default) | `detection` |
+| Answers | *Who is this?* | *What is in frame?* |
+| Stages | detect → embed → match | detect only |
+| Detector input | 640 | 640 |
+| Confidence floor | 0.35 | 0.25 |
+| HOG fallback | yes | **no** |
+| Measured latency | 1000–1900 ms | **124–160 ms** |
+| Threat escalates on | weapon, or unrecognised face | weapon, or covered face |
+
+Recognition mode reports a name, a distance and a match score per face. Detection mode
+reports the detector's own class and confidence and nothing else — no embedding, no gallery
+lookup, no name — plus a per-class tally in `classCounts` so you can see directly whether
+the `mask` class is firing.
+
+Two deliberate choices behind that table:
+
+**Detection mode drops the HOG fallback.** In recognition mode, if YOLO finds no face at all,
+dlib's HOG detector gets a second pass — a face found by any means is still worth
+identifying. But a HOG box says nothing about what is covering the face, so padding detection
+results with one would misrepresent what the detector actually saw. In detection mode a miss
+reads as a miss. HOG boxes are labelled **"Coverage unknown"**, never "Uncovered": claiming
+the latter made masked subjects show up as bare-faced whenever YOLO missed them, which is a
+false statement about the frame, not just a UI wording choice.
+
+**Detection mode lowers the confidence floor to 0.25.** A weak `mask` reading is information
+when the question is "what is in frame?", whereas in recognition mode it would just be a box
+that fails to identify.
+
+### Serving resolution
+
+The weights were trained at `imgsz=640` and are now served at 640. They were previously
+exported at 480, which cost real recall on webcam-framed subjects. Measured on synthesised
+640×360 frames with the subject scaled down, best score for the true class:
+
+| Subject height | Class | @ 480 | @ 640 |
+| --- | --- | --- | --- |
+| 180 px | `no_mask` | 0.062 — **missed** | **0.856** |
+| 180 px | `mask` | 0.514 | **0.715** |
+| 125 px | `mask` | 0.003 — **missed** | 0.234 |
+| any | `weapon` | 0.60–0.87 | 0.60–0.87 |
+
+Weapons were never the problem — that class is robust at both sizes. Faces and coverings were,
+and a covering the detector misses is exactly the case where the old HOG fallback would step
+in and call it "Uncovered". Both halves of that bug are fixed.
+
+`models/best.onnx` is exported with **dynamic height/width**, so one graph serves whatever
+size each mode asks for. That is not a compromise: measured, the dynamic graph is *faster*
+than a fixed-shape one at the same input size (127 ms vs 144 ms at 640; 71 ms vs 102 ms at
+480) and numerically identical. Resident memory at 640 is 223 MB — unchanged from the 480
+build, and well inside the 512 MB free instance.
+
 ## The model
 
 | Stage | Model | Notes |
@@ -65,9 +128,10 @@ Details worth knowing:
 | Embedding | `dlib_face_recognition_resnet_model_v1.dat` | Stock dlib, 128-d output |
 | Matching | Nearest neighbour, euclidean | Accept below the evaluated threshold |
 
-Only the face classes are sent through recognition. A `weapon` box is a scene object, not a
-face — running an identity match on one would be meaningless, so the pipeline keeps the two
-lists separate and lets weapons drive the threat level instead.
+Only the face classes are sent through recognition, and only in `recognition` mode. A
+`weapon` box is a scene object, not a face — running an identity match on one would be
+meaningless, so the pipeline keeps the two lists separate and lets weapons drive the threat
+level instead.
 
 The gallery holds 239 embeddings across 5 enrolled identities.
 
@@ -101,7 +165,9 @@ box.
 
 The torch path is still in the code (`DETECTOR=torch`) if you install
 [`requirements-export.txt`](requirements-export.txt). Regenerate the ONNX graph after
-retraining with `python scripts/export_onnx.py`.
+retraining with `python scripts/export_onnx.py` — it defaults to dynamic axes traced at 640,
+which is what the server expects. Exporting with `--no-dynamic` bakes one size into the graph;
+`detector.py` detects that and warns, and both modes then run at whatever size was baked in.
 
 ### Evaluation
 
@@ -128,17 +194,24 @@ the pipeline working, not as a production benchmark.
 | --- | --- |
 | `GET /` | The demo page |
 | `GET /api/health` | `{"ok": true, "ready": bool}` — never blocks on model loading |
-| `GET /api/info` | Detector backend, enrolled identities, class list, evaluation metrics |
+| `GET /api/info` | Detector backend, enrolled identities, class list, per-mode config, evaluation metrics |
 | `POST /api/detect` | One frame in, detections out |
 
 `POST /api/detect` accepts a raw JPEG/PNG body, a multipart file, or
-`{"image": "data:image/jpeg;base64,...", "threshold": 0.402}` as JSON. `threshold` may also
-be passed as a query parameter or an `X-Threshold` header, and is clamped to 0.20–0.90.
+`{"image": "data:image/jpeg;base64,...", "threshold": 0.402, "mode": "detection"}` as JSON.
+
+| Parameter | Where | Values |
+| --- | --- | --- |
+| `threshold` | query, `X-Threshold` header, or JSON body | clamped to 0.20–0.90 |
+| `mode` | query, `X-Mode` header, or JSON body | `recognition` (default) or `detection` |
+
+`mode` is case-insensitive, and anything unrecognised falls back to the default rather than
+erroring — a typo in a query string should not break the demo.
 
 ```bash
 curl -s -X POST --data-binary @face.jpg \
      -H 'Content-Type: image/jpeg' \
-     'http://localhost:7860/api/detect?threshold=0.402'
+     'http://localhost:7860/api/detect?threshold=0.402&mode=recognition'
 ```
 
 ```json
@@ -150,20 +223,30 @@ curl -s -X POST --data-binary @face.jpg \
     "coverage": "Uncovered",
     "covered": false,
     "detectScore": 0.882,
+    "source": "yolov8-onnx",
     "name": "Barack",
     "authorized": true,
     "distance": 0.3139,
     "confidence": 0.812
   }],
   "objects": [],
+  "mode": "recognition",
   "detector": "yolov8-onnx",
   "threat": "low",
   "threshold": 0.402,
+  "imgsz": 640,
+  "conf": 0.35,
   "frame": {"width": 960, "height": 720},
-  "counts": {"total": 1, "authorized": 1, "unknown": 0, "covered": 0, "weapons": 0},
+  "counts": {"total": 1, "authorized": 1, "unknown": 0, "covered": 0, "weapons": 0, "objects": 0},
+  "classCounts": {"mask": 0, "no_mask": 1, "other_coverings": 0, "weapon": 0},
   "timings": {"detectMs": 254.8, "recognizeMs": 87.4, "totalMs": 344.1}
 }
 ```
+
+In `detection` mode the same shape comes back with `name`, `distance`, `confidence` and
+`authorized` all `null` — nothing was attempted, which is distinct from "attempted and no
+match" (`authorized: false`). `counts.authorized` and `counts.unknown` are therefore always 0
+in that mode; read `classCounts` instead.
 
 The server caps concurrency at 3 in-flight detections and rate-limits per IP (24 burst,
 12/s sustained). Over either limit it returns 429/503 with `"retry": true`, and the client
@@ -205,16 +288,23 @@ failing the deploy, and the app says which one it got under "Model notes" on the
 | --- | --- | --- |
 | `PORT` | `7860` | Bind port |
 | `BEST_THRESHOLD` | `0.402` | Default match threshold |
+| `DEFAULT_MODE` | `recognition` | Which pipeline the page loads in — `recognition` or `detection` |
 | `DETECTOR` | `auto` | `onnx`, `torch` or `hog` to force a backend. `auto` prefers ONNX, then torch, then HOG |
 | `ENABLE_YOLO` | `1` | `0` is shorthand for `DETECTOR=hog` — smallest possible footprint, but no covering or weapon classes |
-| `YOLO_CONF` | `0.35` | Detection confidence floor |
+| `YOLO_CONF` | `0.35` | Confidence floor in recognition mode |
 | `YOLO_IOU` | `0.7` | NMS IoU threshold (ultralytics' predict default) |
-| `YOLO_IMGSZ` | `480` | Torch-backend input size only; the ONNX graph has 480 baked in at export |
+| `YOLO_IMGSZ` | `640` | Detector input size in recognition mode. Rounded to a multiple of 32 and clamped to 320–960 |
+| `DETECTION_CONF` | `0.25` | Confidence floor in detection mode |
+| `DETECTION_IMGSZ` | `640` | Detector input size in detection mode, same rounding |
 | `MAX_FACES` | `4` | Faces embedded per frame |
 | `MAX_OBJECTS` | `8` | Non-face detections returned per frame |
 | `MAX_FRAME_WIDTH` | `960` | Frames wider than this are downscaled before inference |
 | `MAX_IN_FLIGHT` | `3` | Concurrent detections before 503 |
 | `TORCH_THREADS` | `2` | Inference thread count (applies to onnxruntime too, despite the name) |
+
+Both `*_IMGSZ` variables only take effect on a backend that can be resized — the torch path,
+or an ONNX graph exported with dynamic axes (the default). Against a fixed-shape graph they
+are ignored and `/api/info` reports `"resizable": false`.
 
 ## Enrolling your own faces
 
@@ -287,7 +377,11 @@ This is a demonstration, not a security product.
 - Covered faces are detected and labelled, but their embeddings are unreliable by
   construction; the UI marks them rather than pretending otherwise.
 - The weapon class is a detector output, not a judgement. It fires on shapes, and it will be
-  wrong.
+  wrong: a surgical mask lying on a table, with no face in frame, scores `weapon` 0.68.
+- **The detector has a size floor.** Below roughly 90 px of subject height it stops finding
+  faces at all, and coverings degrade before that (see the table under
+  [Serving resolution](#serving-resolution)). Sit close enough to fill a reasonable part of
+  the frame.
 - Accuracy varies with lighting, pose, and camera quality in ways a 55-sample evaluation
   cannot capture.
 

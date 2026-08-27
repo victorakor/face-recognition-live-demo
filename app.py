@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request
 
-from recognizer import DEFAULT_THRESHOLD, get_recognizer, is_ready, warmup
+from recognizer import DEFAULT_MODE, DEFAULT_THRESHOLD, MODES, get_recognizer, is_ready, warmup
 
 # Uploaded frames are ~40-120 KB of JPEG; 6 MB leaves room for a full-resolution
 # still from the image-upload fallback without letting anyone stream junk at us.
@@ -111,9 +111,27 @@ def requested_threshold() -> float:
         return DEFAULT_THRESHOLD
 
 
+def requested_mode() -> str:
+    """Which pipeline to run: "recognition" (identify faces) or "detection" (classes only).
+
+    Read from the same three places as the threshold. An unrecognised value falls back to
+    the default rather than erroring -- a typo in a query string should not break the demo.
+    """
+    raw = request.args.get("mode") or request.headers.get("X-Mode")
+    if raw is None and (request.content_type or "").startswith("application/json"):
+        payload = request.get_json(silent=True) or {}
+        raw = payload.get("mode")
+    if not isinstance(raw, str):
+        return DEFAULT_MODE
+    mode = raw.strip().lower()
+    return mode if mode in MODES else DEFAULT_MODE
+
+
 @app.route("/")
 def index() -> str:
-    return render_template("index.html", default_threshold=DEFAULT_THRESHOLD)
+    return render_template(
+        "index.html", default_threshold=DEFAULT_THRESHOLD, default_mode=DEFAULT_MODE
+    )
 
 
 @app.route("/api/health")
@@ -161,7 +179,9 @@ def detect() -> tuple[Response, int] | Response:
     if not _in_flight.acquire(blocking=False):
         return jsonify({"error": "server busy", "retry": True}), 503
     try:
-        result = get_recognizer().detect(frame, threshold=requested_threshold())
+        result = get_recognizer().detect(
+            frame, threshold=requested_threshold(), mode=requested_mode()
+        )
     except Exception as exc:  # pragma: no cover - surfaced to the client for debugging
         app.logger.exception("detection failed")
         return jsonify({"error": f"detection failed: {exc}"}), 500

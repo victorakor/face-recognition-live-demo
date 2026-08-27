@@ -190,6 +190,52 @@ main {
   text-decoration: underline;
 }
 
+/* ------------------------------------------------------------- mode switch */
+/* Two pipelines, one frame. The switch is a segmented control rather than a checkbox
+   because neither option is a modifier of the other -- they are separate demos. */
+.modebar {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+  padding: 6px;
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+.seg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+.seg strong { font-size: 0.88rem; font-weight: 600; }
+.seg small { font-size: 0.73rem; opacity: 0.85; line-height: 1.35; }
+.seg:hover:not([aria-pressed="true"]) { color: var(--fg); border-color: var(--border); }
+.seg[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.seg:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Panels and tiles that only make sense in one mode. Driven off a body class so the whole
+   page switches in one assignment rather than a dozen hidden toggles. */
+body.mode-recognition .detect-only,
+body.mode-detection .recog-only { display: none; }
+
+@media (max-width: 640px) {
+  .modebar { grid-template-columns: 1fr; }
+}
+
 /* ---------------------------------------------------------------- controls */
 .controls {
   display: flex;

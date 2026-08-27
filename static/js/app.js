@@ -23,6 +23,21 @@
     object: '#fb7185',
   };
 
+  // Detection mode colours boxes by what the detector called them rather than by whether we
+  // recognised them, so the class is readable straight off the overlay.
+  const CLASS_COLORS = {
+    no_mask: '#10b981',
+    mask: '#f59e0b',
+    other_coverings: '#f97316',
+    weapon: '#ef4444',
+    face: '#64748b', // HOG: a face was localised, its covering is unknown
+  };
+
+  const MODE_LABELS = {
+    recognition: 'Alert tone on unrecognised face or weapon',
+    detection: 'Alert tone on weapon or covered face',
+  };
+
   const el = (id) => document.getElementById(id);
   const video = el('video');
   const overlay = el('overlay');
@@ -30,6 +45,7 @@
   const ctx = overlay.getContext('2d');
   const capture = document.createElement('canvas');
   const captureCtx = capture.getContext('2d');
+  const modeButtons = Array.from(document.querySelectorAll('.seg[data-mode]'));
 
   const state = {
     stream: null,
@@ -37,8 +53,11 @@
     facingMode: 'user',
     mirror: true,
     stillImage: null,
+    stillFile: null,
     result: null,
     resultAt: 0,
+    mode: (modeButtons.find((b) => b.getAttribute('aria-pressed') === 'true') || {}).dataset?.mode
+      || 'recognition',
     threshold: parseFloat(el('threshold').value),
     frameTimes: [],
     lastAlertAt: 0,
@@ -49,6 +68,8 @@
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const pct = (value) =>
+    value === null || value === undefined || Number.isNaN(value) ? '' : `${(value * 100).toFixed(0)}%`;
 
   /* -------------------------------------------------------------- model info */
 
@@ -80,6 +101,11 @@
       state.identities = model.identities || [];
       renderIdentities();
       el('galleryCount').textContent = `· ${model.gallerySize} embeddings`;
+
+      // The detection-mode copy quotes the input size the server will actually use, which
+      // depends on whether the ONNX graph was exported with dynamic axes.
+      const detectionImgsz = ((model.modeConfig || {}).detection || {}).imgsz;
+      if (detectionImgsz) el('hintImgsz').textContent = String(detectionImgsz);
 
       renderChips(
         el('classChips'),
@@ -167,6 +193,7 @@
     await waitForVideoDimensions();
 
     state.stillImage = null;
+    state.stillFile = null;
     state.result = null;
     el('gate').hidden = true;
     el('gateError').hidden = true;
@@ -262,7 +289,8 @@
   }
 
   async function postFrame(blob) {
-    const response = await fetch(`/api/detect?threshold=${state.threshold.toFixed(3)}`, {
+    const query = `threshold=${state.threshold.toFixed(3)}&mode=${encodeURIComponent(state.mode)}`;
+    const response = await fetch(`/api/detect?${query}`, {
       method: 'POST',
       headers: { 'Content-Type': 'image/jpeg' },
       body: blob,
@@ -322,30 +350,45 @@
     state.result = result;
     state.resultAt = performance.now();
 
+    const detectionMode = result.mode === 'detection';
     const ms = Math.round(result.timings.totalMs);
     el('statFaces').textContent = String(result.counts.total);
-    el('statKnown').textContent = String(result.counts.authorized);
-    el('statUnknown').textContent = String(result.counts.unknown);
-    el('statCovered').textContent = String(result.counts.covered);
     el('statWeapons').textContent = String(result.counts.weapons);
     el('statLatency').textContent = `${ms} ms`;
     el('latencyBadge').textContent = `${ms} ms`;
+
+    if (detectionMode) {
+      // Per-class tallies straight from the detector -- no identity was attempted, so the
+      // recognised/unknown split would be meaningless here.
+      const classCounts = result.classCounts || {};
+      el('statNoMask').textContent = String(classCounts.no_mask || 0);
+      el('statMask').textContent = String(classCounts.mask || 0);
+      el('statOther').textContent = String(classCounts.other_coverings || 0);
+    } else {
+      el('statKnown').textContent = String(result.counts.authorized);
+      el('statUnknown').textContent = String(result.counts.unknown);
+      el('statCovered').textContent = String(result.counts.covered);
+
+      let discovered = false;
+      for (const face of result.faces) {
+        if (face.authorized && !state.seen.has(face.name)) {
+          state.seen.add(face.name);
+          discovered = true;
+        }
+      }
+      if (discovered) renderIdentities();
+    }
 
     const badge = el('threatBadge');
     badge.textContent = `threat: ${result.threat}`;
     badge.className = `badge threat-${result.threat}`;
 
-    let discovered = false;
-    for (const face of result.faces) {
-      if (face.authorized && !state.seen.has(face.name)) {
-        state.seen.add(face.name);
-        discovered = true;
-      }
-    }
-    if (discovered) renderIdentities();
-
     logResult(result);
-    if (result.counts.unknown > 0 || result.counts.weapons > 0) maybeAlert();
+
+    const alarming = detectionMode
+      ? result.counts.weapons > 0 || result.counts.covered > 0
+      : result.counts.unknown > 0 || result.counts.weapons > 0;
+    if (alarming) maybeAlert();
   }
 
   /* --------------------------------------------------------------- rendering */
@@ -379,32 +422,40 @@
 
     const lineWidth = Math.max(2, Math.round(width / 320));
     const fontSize = Math.max(12, Math.round(width / 42));
+    const detectionMode = result.mode === 'detection';
 
     for (const object of result.objects || []) {
       drawBox(object.boxNorm, width, height, {
-        color: COLORS.object,
+        color: CLASS_COLORS[object.label] || COLORS.object,
         lineWidth,
         fontSize,
         dashed: true,
-        label: `${object.label} ${(object.score * 100).toFixed(0)}%`,
+        label: `${object.label} ${pct(object.score)}`.trim(),
       });
     }
 
     for (const face of result.faces) {
-      const color = face.authorized ? COLORS.known : (face.covered ? COLORS.covered : COLORS.unknown);
-      const parts = [face.authorized ? face.name : 'Unknown'];
-      if (face.authorized) parts.push(`${(face.confidence * 100).toFixed(0)}%`);
-      if (face.covered) parts.push(face.coverage);
+      // Detection mode has no identity to show, so the box carries the detector's own class
+      // and score. Recognition mode leads with the name and keeps the distance underneath.
+      const options = detectionMode
+        ? {
+            color: CLASS_COLORS[face.cls] || COLORS.object,
+            label: `${face.cls} ${pct(face.detectScore)}`.trim(),
+            sublabel: null,
+          }
+        : {
+            color: face.authorized ? COLORS.known : (face.covered ? COLORS.covered : COLORS.unknown),
+            label: [
+              face.authorized ? face.name : 'Unknown',
+              face.authorized ? pct(face.confidence) : '',
+              face.covered ? face.coverage : '',
+            ].filter(Boolean).join(' · '),
+            sublabel: face.distance === null || face.distance === undefined
+              ? null
+              : `d=${face.distance.toFixed(3)}`,
+          };
 
-      drawBox(face.boxNorm, width, height, {
-        color,
-        lineWidth,
-        fontSize,
-        label: parts.join(' · '),
-        sublabel: face.distance === null || face.distance === undefined
-          ? null
-          : `d=${face.distance.toFixed(3)}`,
-      });
+      drawBox(face.boxNorm, width, height, { ...options, lineWidth, fontSize });
     }
     ctx.globalAlpha = 1;
   }
@@ -465,18 +516,25 @@
   /* --------------------------------------------------------------------- log */
 
   function logResult(result) {
+    const detectionMode = result.mode === 'detection';
     const entries = [
-      ...result.faces.map((face) => ({
-        who: face.authorized ? face.name : 'Unknown',
-        kind: face.authorized ? 'known' : 'unknown',
-        detail: face.distance === null || face.distance === undefined
-          ? face.coverage
-          : `${face.coverage} · d=${face.distance.toFixed(3)}`,
-      })),
+      ...result.faces.map((face) => (detectionMode
+        ? {
+            who: face.cls,
+            kind: face.covered ? 'unknown' : 'object',
+            detail: `${face.coverage} · ${pct(face.detectScore)}`,
+          }
+        : {
+            who: face.authorized ? face.name : 'Unknown',
+            kind: face.authorized ? 'known' : 'unknown',
+            detail: face.distance === null || face.distance === undefined
+              ? face.coverage
+              : `${face.coverage} · d=${face.distance.toFixed(3)}`,
+          })),
       ...(result.objects || []).map((object) => ({
         who: object.label,
         kind: 'object',
-        detail: `${(object.score * 100).toFixed(0)}% confidence`,
+        detail: `${pct(object.score)} confidence`,
       })),
     ];
     if (!entries.length) return;
@@ -507,6 +565,41 @@
       list.insertBefore(item, list.firstChild);
     }
     while (list.children.length > LOG_LIMIT) list.removeChild(list.lastChild);
+  }
+
+  function clearLog() {
+    el('log').innerHTML = '<li class="muted">Nothing yet.</li>';
+  }
+
+  /* -------------------------------------------------------------- mode switch */
+
+  function setMode(mode) {
+    if (mode === state.mode || !(mode in MODE_LABELS)) return;
+    state.mode = mode;
+    const recognition = mode === 'recognition';
+
+    // One body class drives every .recog-only / .detect-only panel and tile.
+    document.body.classList.toggle('mode-recognition', recognition);
+    document.body.classList.toggle('mode-detection', !recognition);
+    for (const button of modeButtons) {
+      button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+    }
+
+    el('hintRecognition').hidden = !recognition;
+    el('hintDetection').hidden = recognition;
+    el('classHintRecognition').hidden = !recognition;
+    el('classHintDetection').hidden = recognition;
+    el('thresholdRow').hidden = !recognition;
+    el('alertLabel').textContent = MODE_LABELS[mode];
+
+    // The previous mode's boxes and log lines are labelled by a pipeline that is no longer
+    // running, so drop them rather than leave them on screen looking current.
+    state.result = null;
+    clearLog();
+
+    // A still image would otherwise keep showing the old mode's result until the visitor
+    // re-picks the file. Live video just picks the new mode up on its next frame.
+    if (state.stillFile) analyseFile(state.stillFile);
   }
 
   /* ------------------------------------------------------------------- audio */
@@ -564,6 +657,7 @@
       await image.decode();
 
       state.stillImage = image;
+      state.stillFile = file;
       state.mirror = false;
       state.result = null;
       syncViewportAspect(image.naturalWidth, image.naturalHeight);
@@ -592,6 +686,9 @@
 
   el('startBtn').addEventListener('click', startCamera);
   el('switchBtn').addEventListener('click', switchCamera);
+  for (const button of modeButtons) {
+    button.addEventListener('click', () => setMode(button.dataset.mode));
+  }
   el('pickFileBtn').addEventListener('click', () => el('fileInput').click());
   el('photoBtn').addEventListener('click', () => el('fileInput').click());
   el('fileInput').addEventListener('change', (event) => {

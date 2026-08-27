@@ -11,6 +11,11 @@ Three of them, tried in preference order:
 Each backend takes a BGR frame and returns a list of `Detection`. Everything above this
 layer (splitting faces from objects, embedding, matching) is the recogniser's job.
 
+Input size and confidence are per-call rather than fixed at construction, because the two
+demo modes want different trade-offs from the same weights: recognition wants speed,
+detection wants recall. The ONNX graph is exported with dynamic H/W so one session serves
+both -- see scripts/export_onnx.py.
+
 The ONNX path is the interesting one: onnxruntime hands back YOLOv8's raw head output, so
 letterboxing, score extraction, NMS and coordinate un-mapping are done here rather than by
 ultralytics. Getting the letterbox arithmetic wrong shifts every box, so it deliberately
@@ -33,8 +38,25 @@ _PAD_VALUE = 114
 # the same overlaps the torch path would.
 DEFAULT_IOU = float(os.getenv("YOLO_IOU", "0.7"))
 
+# The size these weights were trained at, straight out of the checkpoint's train_args.
+# Serving them smaller measurably costs recall: a webcam-framed face 125-180 px tall scores
+# 0.86 at 640 and 0.06 at 480, i.e. detected versus missed. Do not lower this to save time
+# without re-reading the table in the README.
+TRAIN_IMGSZ = 640
+
+# YOLOv8 strides down by 32, so the input has to be a multiple of it. The bounds are a
+# sanity clamp on anything arriving from an environment variable or a query parameter.
+_STRIDE = 32
+MIN_IMGSZ, MAX_IMGSZ = 320, 960
+
 # Only used if a model somehow arrives without the names metadata ultralytics writes.
 _FALLBACK_CLASSES = ["no_mask", "mask", "other_coverings", "weapon"]
+
+
+def round_imgsz(value: int) -> int:
+    """Clamp to [MIN_IMGSZ, MAX_IMGSZ] and snap to the nearest multiple of the stride."""
+    value = int(max(MIN_IMGSZ, min(MAX_IMGSZ, value)))
+    return max(MIN_IMGSZ, int(round(value / _STRIDE)) * _STRIDE)
 
 
 class Detection(NamedTuple):
@@ -46,8 +68,16 @@ class Detection(NamedTuple):
 class Detector(Protocol):
     name: str
     classes: list[str]
+    # Whether `imgsz` on the call below actually does anything.
+    resizable: bool
 
-    def __call__(self, frame_bgr: np.ndarray) -> list[Detection]: ...
+    def __call__(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        imgsz: int | None = None,
+        conf: float | None = None,
+    ) -> list[Detection]: ...
 
 
 # --------------------------------------------------------------------------------------
@@ -58,7 +88,14 @@ class Detector(Protocol):
 class OnnxDetector:
     name = "yolov8-onnx"
 
-    def __init__(self, model_path: str, conf: float, iou: float = DEFAULT_IOU, threads: int = 2):
+    def __init__(
+        self,
+        model_path: str,
+        conf: float,
+        iou: float = DEFAULT_IOU,
+        threads: int = 2,
+        imgsz: int = TRAIN_IMGSZ,
+    ):
         import onnxruntime as ort
 
         options = ort.SessionOptions()
@@ -76,10 +113,16 @@ class OnnxDetector:
 
         spec = self.session.get_inputs()[0]
         self.input_name = spec.name
-        # [1, 3, H, W]; the export is fixed-shape, but fall back to 480 if it ever is not.
+
+        # [1, 3, H, W]. A dynamic export leaves H and W as symbolic names ('height'), which
+        # is what lets a single session serve both modes at different sizes. A fixed-shape
+        # export pins us to whatever it was exported at, and `imgsz` becomes a no-op.
         _, _, height, width = spec.shape
-        self.height = int(height) if isinstance(height, int) else 480
-        self.width = int(width) if isinstance(width, int) else 480
+        self.resizable = not (isinstance(height, int) and isinstance(width, int))
+        if self.resizable:
+            self.height = self.width = round_imgsz(imgsz)
+        else:
+            self.height, self.width = int(height), int(width)
 
         self.classes = self._read_classes()
 
@@ -98,31 +141,49 @@ class OnnxDetector:
                 pass
         return list(_FALLBACK_CLASSES)
 
-    def _letterbox(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, float, int, int]:
+    def _target_size(self, imgsz: int | None) -> tuple[int, int]:
+        """The H, W to letterbox into for this call."""
+        if imgsz is None or not self.resizable:
+            return self.height, self.width
+        side = round_imgsz(imgsz)
+        return side, side
+
+    def _letterbox(
+        self, frame_bgr: np.ndarray, height: int, width: int
+    ) -> tuple[np.ndarray, float, int, int]:
         """Resize preserving aspect ratio and centre-pad to the model's input size.
 
         The `round(pad - 0.1)` is ultralytics' own rounding, kept so an odd number of
         padding pixels lands on the same side as it would in the torch path.
         """
-        height, width = frame_bgr.shape[:2]
-        gain = min(self.height / height, self.width / width)
-        new_w, new_h = int(round(width * gain)), int(round(height * gain))
+        source_h, source_w = frame_bgr.shape[:2]
+        gain = min(height / source_h, width / source_w)
+        new_w, new_h = int(round(source_w * gain)), int(round(source_h * gain))
 
-        if (new_w, new_h) != (width, height):
+        if (new_w, new_h) != (source_w, source_h):
             interpolation = cv2.INTER_LINEAR if gain > 1 else cv2.INTER_AREA
             frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=interpolation)
 
-        pad_w = (self.width - new_w) / 2
-        pad_h = (self.height - new_h) / 2
+        pad_w = (width - new_w) / 2
+        pad_h = (height - new_h) / 2
         left, top = int(round(pad_w - 0.1)), int(round(pad_h - 0.1))
 
-        canvas = np.full((self.height, self.width, 3), _PAD_VALUE, dtype=np.uint8)
+        canvas = np.full((height, width, 3), _PAD_VALUE, dtype=np.uint8)
         canvas[top : top + new_h, left : left + new_w] = frame_bgr
         return canvas, gain, left, top
 
-    def __call__(self, frame_bgr: np.ndarray) -> list[Detection]:
+    def __call__(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        imgsz: int | None = None,
+        conf: float | None = None,
+    ) -> list[Detection]:
         height, width = frame_bgr.shape[:2]
-        canvas, gain, pad_left, pad_top = self._letterbox(frame_bgr)
+        net_h, net_w = self._target_size(imgsz)
+        threshold = self.conf if conf is None else float(conf)
+
+        canvas, gain, pad_left, pad_top = self._letterbox(frame_bgr, net_h, net_w)
 
         # BGR->RGB, HWC->CHW, 0..1. ascontiguousarray because the channel reverse and
         # transpose leave a non-contiguous view that onnxruntime would have to copy anyway.
@@ -131,14 +192,16 @@ class OnnxDetector:
         )
         raw = self.session.run(None, {self.input_name: blob})[0]
 
-        # (1, 4 + nc, anchors) -> (anchors, 4 + nc). YOLOv8 has no objectness channel and the
-        # class scores are already activated, so the class score IS the confidence.
+        # (1, 4 + nc, anchors) -> (anchors, 4 + nc). The anchor count follows the input size
+        # (4725 at 480, 8400 at 640), which is why nothing here hardcodes it. YOLOv8 has no
+        # objectness channel and the class scores are already activated, so the class score
+        # IS the confidence.
         preds = raw[0].T
         scores_per_class = preds[:, 4:]
         class_ids = scores_per_class.argmax(axis=1)
         scores = scores_per_class[np.arange(scores_per_class.shape[0]), class_ids]
 
-        keep = scores >= self.conf
+        keep = scores >= threshold
         if not np.any(keep):
             return []
         boxes, scores, class_ids = preds[keep, :4], scores[keep], class_ids[keep]
@@ -150,12 +213,12 @@ class OnnxDetector:
         # Per-class NMS without cv2.dnn.NMSBoxesBatched (not in every OpenCV build): push
         # each class into its own coordinate region so boxes of different classes can never
         # overlap enough to suppress each other.
-        stride = float(max(self.width, self.height) + 1)
+        stride = float(max(net_w, net_h) + 1)
         offsets = (class_ids.astype(np.float32) * stride)[:, None]
         nms_input = np.concatenate([xy + offsets, wh], axis=1)
 
         indices = cv2.dnn.NMSBoxes(
-            nms_input.tolist(), scores.astype(np.float32).tolist(), self.conf, self.iou
+            nms_input.tolist(), scores.astype(np.float32).tolist(), threshold, self.iou
         )
         if indices is None or len(indices) == 0:
             return []
@@ -197,6 +260,7 @@ class OnnxDetector:
 
 class TorchDetector:
     name = "yolov8-torch"
+    resizable = True
 
     def __init__(self, model_path: str, imgsz: int, conf: float, threads: int = 2):
         import torch
@@ -218,15 +282,24 @@ class TorchDetector:
         finally:
             torch.load = original_load
 
-        self.imgsz = imgsz
+        self.imgsz = round_imgsz(imgsz)
         self.conf = conf
         names = self.model.names or {}
         self.classes = [str(names[key]) for key in sorted(names)]
 
-    def __call__(self, frame_bgr: np.ndarray) -> list[Detection]:
+    def __call__(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        imgsz: int | None = None,
+        conf: float | None = None,
+    ) -> list[Detection]:
         height, width = frame_bgr.shape[:2]
         results = self.model.predict(
-            source=frame_bgr, imgsz=self.imgsz, conf=self.conf, verbose=False
+            source=frame_bgr,
+            imgsz=self.imgsz if imgsz is None else round_imgsz(imgsz),
+            conf=self.conf if conf is None else float(conf),
+            verbose=False,
         )
         detections: list[Detection] = []
         for result in results:
@@ -256,19 +329,31 @@ class TorchDetector:
 class HogDetector:
     """Faces only, and it says so: every detection is labelled "face" with no score.
 
+    "face" is deliberately not one of the covering classes. HOG cannot tell whether a face
+    is masked, so the recogniser maps it to "coverage unknown" rather than claiming the face
+    is uncovered -- which is what it used to do, and which made the covering classes look
+    broken whenever this fallback fired.
+
     HOG is slow at full resolution, so frames wider than 480 px are halved first -- roughly
     4x cheaper and plenty for webcam framing.
     """
 
     name = "dlib-hog"
     classes: list[str] = ["face"]
+    resizable = False
 
     def __init__(self) -> None:
         import dlib
 
         self.detector = dlib.get_frontal_face_detector()
 
-    def __call__(self, frame_bgr: np.ndarray) -> list[Detection]:
+    def __call__(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        imgsz: int | None = None,
+        conf: float | None = None,
+    ) -> list[Detection]:
         height, width = frame_bgr.shape[:2]
         scale = 2 if width > 480 else 1
         small = frame_bgr if scale == 1 else cv2.resize(frame_bgr, (width // 2, height // 2))
@@ -325,7 +410,13 @@ def build_detector(
             continue
         try:
             if backend == "onnx":
-                return OnnxDetector(path, conf=conf, threads=threads), warnings
+                detector = OnnxDetector(path, conf=conf, threads=threads, imgsz=imgsz)
+                if not detector.resizable:
+                    warnings.append(
+                        f"onnx graph is fixed at {detector.width}x{detector.height}: "
+                        "per-mode input size disabled (re-run scripts/export_onnx.py)"
+                    )
+                return detector, warnings
             return TorchDetector(path, imgsz=imgsz, conf=conf, threads=threads), warnings
         except Exception as exc:  # pragma: no cover - depends on which wheels are installed
             warnings.append(f"{backend} detector unavailable ({exc})")

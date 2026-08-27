@@ -13,6 +13,11 @@ Pipeline
     3. Match -- nearest neighbour (euclidean) against the gallery in
        models/known_faces.pkl, accepted below the threshold chosen during evaluation
        (0.402, ROC AUC 0.9857).
+
+Steps 2 and 3 only run in `recognition` mode. `detection` mode stops after step 1 and
+reports the detector's own classes, which is what makes it worth running the detector at its
+full training resolution -- the time saved by skipping the embedding pays for the bigger
+input. See MODES below.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ import cv2
 import dlib
 import numpy as np
 
-from detector import HogDetector, build_detector
+from detector import TRAIN_IMGSZ, HogDetector, build_detector
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -56,10 +61,32 @@ DETECTOR_PREFERENCE = os.getenv("DETECTOR", "auto").strip().lower()
 if os.getenv("ENABLE_YOLO", "1").lower() in ("0", "false", "no"):
     DETECTOR_PREFERENCE = "hog"
 
-# Only used by the torch backend; the ONNX export has its input size baked in (480).
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "480"))
+# The weights were trained at 640 and that is what they are served at. The ONNX export has
+# dynamic H/W so both modes share one session at whatever size each asks for.
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", str(TRAIN_IMGSZ)))
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
 TORCH_THREADS = int(os.getenv("TORCH_THREADS", "2"))
+
+# Detection mode exists to show what the detector itself sees, so it runs at the training
+# size and drops the confidence floor -- a weak "mask" reading is information here, whereas
+# in recognition mode it would just be a box that fails to identify.
+DETECTION_IMGSZ = int(os.getenv("DETECTION_IMGSZ", str(YOLO_IMGSZ)))
+DETECTION_CONF = float(os.getenv("DETECTION_CONF", "0.25"))
+
+# The two things this demo can do with one camera frame.
+#
+#   recognition  YOLO locates faces -> dlib embeds each one -> nearest neighbour in the
+#                gallery. Answers "who is this?". The HOG fallback is allowed, because a
+#                face found by any means is still a face worth identifying.
+#   detection    YOLO only, nothing else. Answers "what is in frame?" -- which covering,
+#                and is there a weapon. No embedding, no gallery, no HOG: the point is to
+#                show the detector's own output, so a miss should read as a miss.
+MODE_RECOGNITION = "recognition"
+MODE_DETECTION = "detection"
+MODES = (MODE_RECOGNITION, MODE_DETECTION)
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", MODE_RECOGNITION).strip().lower()
+if DEFAULT_MODE not in MODES:
+    DEFAULT_MODE = MODE_RECOGNITION
 
 # Guardrails so one busy frame cannot pin the CPU for seconds. Embedding a face is the
 # expensive step, so the face cap is tighter than the object cap.
@@ -72,12 +99,13 @@ MAX_FRAME_WIDTH = int(os.getenv("MAX_FRAME_WIDTH", "960"))
 FACE_CLASSES = {"no_mask", "mask", "other_coverings", "face"}
 
 # How each face class is described in the UI, and whether the covering makes identity
-# matching unreliable.
+# matching unreliable. "face" is what the HOG fallback emits: it localises a face but cannot
+# say anything about a covering, so it must not claim the face is uncovered.
 COVERAGE = {
     "no_mask": ("Uncovered", False),
-    "face": ("Uncovered", False),
     "mask": ("Mask", True),
     "other_coverings": ("Covered", True),
+    "face": ("Coverage unknown", False),
 }
 
 # Width of the logistic used to turn a raw embedding distance into a 0..1 score.
@@ -154,11 +182,13 @@ class FaceRecognizer:
         self.detector_backend = self.detector.name
         self.detector_classes = list(self.detector.classes)
 
-        # Warm the graph so the first visitor does not pay for the first allocation.
-        try:
-            self.detector(np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8))
-        except Exception as exc:  # pragma: no cover - a broken backend is worth reporting
-            self.warnings.append(f"detector warm-up failed ({exc})")
+        # Warm the graph so the first visitor does not pay for the first allocation. Both
+        # sizes, because switching mode mid-session would otherwise pay it again.
+        for size in dict.fromkeys((YOLO_IMGSZ, DETECTION_IMGSZ)):
+            try:
+                self.detector(np.zeros((size, size, 3), dtype=np.uint8), imgsz=size)
+            except Exception as exc:  # pragma: no cover - a broken backend is worth reporting
+                self.warnings.append(f"detector warm-up failed at {size}px ({exc})")
 
     def _load_gallery(self) -> None:
         if not os.path.exists(KNOWN_FACES_PATH):
@@ -191,6 +221,8 @@ class FaceRecognizer:
         return {
             "detector": self.detector_backend,
             "detectorClasses": self.detector_classes,
+            "faceClasses": [c for c in self.detector_classes if c in FACE_CLASSES],
+            "objectClasses": [c for c in self.detector_classes if c not in FACE_CLASSES],
             "recognitionReady": self.recognition_ready,
             "identities": self.identities,
             "gallerySize": int(len(self.known_labels)),
@@ -198,20 +230,47 @@ class FaceRecognizer:
             "embeddingDim": int(self.known_embeddings.shape[1]) if len(self.known_labels) else 0,
             "maxFaces": MAX_FACES,
             "blas": bool(getattr(dlib, "DLIB_USE_BLAS", False)),
+            "modes": list(MODES),
+            "defaultMode": DEFAULT_MODE,
+            # Per-mode input size and confidence floor, so the page can explain why the two
+            # modes behave differently instead of leaving it to be guessed at.
+            "modeConfig": {
+                MODE_RECOGNITION: {"imgsz": YOLO_IMGSZ, "conf": YOLO_CONF, "recognises": True},
+                MODE_DETECTION: {
+                    "imgsz": DETECTION_IMGSZ,
+                    "conf": DETECTION_CONF,
+                    "recognises": False,
+                },
+            },
+            "resizable": bool(getattr(self.detector, "resizable", False)),
+            "trainImgsz": TRAIN_IMGSZ,
             "warnings": self.warnings,
         }
 
     # ---------------------------------------------------------------- inference
-    def detect(self, frame_bgr: np.ndarray, threshold: float | None = None) -> dict[str, Any]:
-        """Run detection + recognition on one BGR frame.
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        threshold: float | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Run one frame through the pipeline selected by `mode`.
+
+        recognition -- detect, then embed and match every face.
+        detection   -- detect only, and report the class the detector assigned.
 
         Boxes come back both in pixels (relative to the frame actually analysed) and
         normalised to 0..1, so the browser can scale them onto whatever size it renders the
         video at.
         """
+        if mode not in MODES:
+            mode = DEFAULT_MODE
         if threshold is None:
             threshold = DEFAULT_THRESHOLD
         threshold = float(max(0.20, min(0.90, threshold)))
+
+        imgsz = DETECTION_IMGSZ if mode == MODE_DETECTION else YOLO_IMGSZ
+        conf = DETECTION_CONF if mode == MODE_DETECTION else YOLO_CONF
 
         started = time.perf_counter()
         frame_bgr = self._downscale(frame_bgr)
@@ -219,12 +278,17 @@ class FaceRecognizer:
 
         with self._lock:
             detect_started = time.perf_counter()
-            face_boxes, objects = self._detect(frame_bgr)
+            face_boxes, objects = self._detect(frame_bgr, mode=mode, imgsz=imgsz, conf=conf)
             detect_ms = (time.perf_counter() - detect_started) * 1000.0
 
             recognise_started = time.perf_counter()
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            faces = [self._describe(frame_rgb, entry, threshold) for entry in face_boxes]
+            if mode == MODE_RECOGNITION:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                faces = [self._describe(frame_rgb, entry, threshold) for entry in face_boxes]
+            else:
+                # Detection mode never touches dlib -- that is the whole point, and it is
+                # what pays for running the detector at its full training size.
+                faces = [self._classify(entry) for entry in face_boxes]
             recognise_ms = (time.perf_counter() - recognise_started) * 1000.0
 
         for item in (*faces, *objects):
@@ -232,28 +296,47 @@ class FaceRecognizer:
             item["boxNorm"] = [x1 / width, y1 / height, x2 / width, y2 / height]
 
         weapons = sum(1 for obj in objects if obj["label"] == "weapon")
-        unknown = sum(1 for face in faces if not face["authorized"])
+        covered = sum(1 for face in faces if face["covered"])
+        unknown = sum(1 for face in faces if face["authorized"] is False)
+
+        # A weapon dominates either way. Failing that, the thing each mode is watching for:
+        # an unrecognised face when identifying, a covered face when detecting.
         if weapons:
             threat = "high"
-        elif unknown:
+        elif mode == MODE_RECOGNITION and unknown:
+            threat = "elevated"
+        elif mode == MODE_DETECTION and covered:
             threat = "elevated"
         else:
             threat = "low"
 
+        # Per-class tally over everything the detector returned. This is the direct answer to
+        # "is the mask class firing at all?", which is otherwise buried in the box list.
+        class_counts: dict[str, int] = {name: 0 for name in self.detector_classes}
+        for item in (*faces, *objects):
+            label = item.get("cls") or item.get("label")
+            if label:
+                class_counts[label] = class_counts.get(label, 0) + 1
+
         return {
             "faces": faces,
             "objects": objects,
+            "mode": mode,
             "detector": self.detector_backend,
             "threshold": threshold,
+            "imgsz": imgsz,
+            "conf": conf,
             "threat": threat,
             "frame": {"width": width, "height": height},
             "counts": {
                 "total": len(faces),
-                "authorized": len(faces) - unknown,
+                "authorized": sum(1 for face in faces if face["authorized"] is True),
                 "unknown": unknown,
-                "covered": sum(1 for face in faces if face["covered"]),
+                "covered": covered,
                 "weapons": weapons,
+                "objects": len(objects),
             },
+            "classCounts": class_counts,
             "timings": {
                 "detectMs": round(detect_ms, 1),
                 "recognizeMs": round(recognise_ms, 1),
@@ -273,7 +356,12 @@ class FaceRecognizer:
         )
 
     def _detect(
-        self, frame_bgr: np.ndarray
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        mode: str,
+        imgsz: int,
+        conf: float,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Split the detector's output into faces (to identify) and other objects."""
         height, width = frame_bgr.shape[:2]
@@ -281,7 +369,7 @@ class FaceRecognizer:
         objects: list[dict[str, Any]] = []
 
         try:
-            detections = self.detector(frame_bgr)
+            detections = self.detector(frame_bgr, imgsz=imgsz, conf=conf)
         except Exception:
             detections = []
 
@@ -291,7 +379,12 @@ class FaceRecognizer:
                 continue
             if detection.label in FACE_CLASSES:
                 faces.append(
-                    {"box": list(clipped), "cls": detection.label, "detectScore": detection.score}
+                    {
+                        "box": list(clipped),
+                        "cls": detection.label,
+                        "detectScore": detection.score,
+                        "source": self.detector_backend,
+                    }
                 )
             else:
                 objects.append(
@@ -299,17 +392,32 @@ class FaceRecognizer:
                         "box": list(clipped),
                         "label": detection.label,
                         "score": round(detection.score, 3) if detection.score is not None else None,
+                        "source": self.detector_backend,
                     }
                 )
 
         # The weights were trained on covered faces, so a plain uncovered face at an odd
         # angle is the case they most often miss. HOG is cheap enough to be worth a second
-        # pass when the detector came back with nothing.
-        if not faces and self.hog_detector is not None and not isinstance(self.detector, HogDetector):
+        # pass when the detector came back with nothing -- but only when we are identifying.
+        # Detection mode deliberately skips it: a HOG box says nothing about coverings, so
+        # padding the results with one would misrepresent what the detector actually saw.
+        if (
+            mode == MODE_RECOGNITION
+            and not faces
+            and self.hog_detector is not None
+            and not isinstance(self.detector, HogDetector)
+        ):
             for detection in self.hog_detector(frame_bgr):
                 clipped = self._clip(detection.box, width, height)
                 if clipped is not None:
-                    faces.append({"box": list(clipped), "cls": "face", "detectScore": None})
+                    faces.append(
+                        {
+                            "box": list(clipped),
+                            "cls": "face",
+                            "detectScore": None,
+                            "source": self.hog_detector.name,
+                        }
+                    )
 
         # Largest first, so the caps drop background bystanders rather than whoever is
         # actually standing in front of the camera.
@@ -328,23 +436,38 @@ class FaceRecognizer:
             return None
         return x1, y1, x2, y2
 
-    def _describe(
-        self, frame_rgb: np.ndarray, entry: dict[str, Any], threshold: float
-    ) -> dict[str, Any]:
-        x1, y1, x2, y2 = entry["box"]
+    @staticmethod
+    def _base_face(entry: dict[str, Any]) -> dict[str, Any]:
+        """The part of a face record that needs no embedding: box, class, covering."""
         coverage_label, covered = COVERAGE.get(entry["cls"], ("Face", False))
-
-        face: dict[str, Any] = {
+        return {
             "box": entry["box"],
             "cls": entry["cls"],
             "coverage": coverage_label,
             "covered": covered,
-            "detectScore": round(entry["detectScore"], 3) if entry["detectScore"] is not None else None,
-            "name": "Unknown",
-            "authorized": False,
+            "detectScore": round(entry["detectScore"], 3)
+            if entry["detectScore"] is not None
+            else None,
+            "source": entry.get("source"),
+            "name": None,
+            # None means "not attempted", which is what detection mode reports. False means
+            # "attempted and no gallery match". The counters rely on the difference.
+            "authorized": None,
             "distance": None,
             "confidence": None,
         }
+
+    def _classify(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Detection mode: report the class the detector assigned and stop there."""
+        return self._base_face(entry)
+
+    def _describe(
+        self, frame_rgb: np.ndarray, entry: dict[str, Any], threshold: float
+    ) -> dict[str, Any]:
+        x1, y1, x2, y2 = entry["box"]
+        face = self._base_face(entry)
+        face["name"] = "Unknown"
+        face["authorized"] = False
 
         if not self.recognition_ready:
             return face

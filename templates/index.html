@@ -8,7 +8,7 @@
   <link rel="icon" href="{{ url_for('static', filename='favicon.png') }}" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
 </head>
-<body>
+<body class="mode-{{ default_mode }}">
   <header class="topbar">
     <div class="brand">
       <span class="brand-dot" aria-hidden="true"></span>
@@ -54,44 +54,67 @@
         </div>
       </div>
 
+      <div class="modebar" role="group" aria-label="Pipeline mode">
+        <button class="seg" id="modeRecognition" data-mode="recognition"
+                aria-pressed="{{ 'true' if default_mode == 'recognition' else 'false' }}">
+          <strong>Recognise faces</strong>
+          <small>Who is this? — YOLOv8 + dlib identification</small>
+        </button>
+        <button class="seg" id="modeDetection" data-mode="detection"
+                aria-pressed="{{ 'true' if default_mode == 'detection' else 'false' }}">
+          <strong>Detect masks &amp; weapons</strong>
+          <small>What is in frame? — YOLOv8 detector only</small>
+        </button>
+      </div>
+
       <div class="controls">
         <button class="btn" id="toggleBtn" disabled>Pause</button>
         <button class="btn" id="switchBtn" hidden>Switch camera</button>
         <button class="btn" id="photoBtn">Analyse a photo</button>
         <label class="switch-row">
           <input type="checkbox" id="alertSound" />
-          <span>Alert tone on unrecognised face or weapon</span>
+          <span id="alertLabel">Alert tone on unrecognised face or weapon</span>
         </label>
         <div class="spacer"></div>
-        <label class="slider-row">
+        <label class="slider-row" id="thresholdRow">
           <span>Match threshold</span>
           <input type="range" id="threshold" min="0.25" max="0.75" step="0.005"
                  value="{{ '%.3f'|format(default_threshold) }}" />
           <output id="thresholdOut">{{ '%.3f'|format(default_threshold) }}</output>
         </label>
       </div>
-      <p class="hint">
+      <p class="hint" id="hintRecognition">
         Lower threshold = stricter matching (fewer false accepts). The default
         <code>{{ '%.3f'|format(default_threshold) }}</code> is the operating point chosen by
         the ROC sweep during evaluation. <code>d</code> under each box is the raw embedding
         distance to the closest enrolled face.
+      </p>
+      <p class="hint" id="hintDetection" hidden>
+        No identification runs in this mode — no embedding, no gallery lookup, no name. Every
+        box is the detector's own class and confidence, and the time saved by skipping
+        recognition is spent running the detector at its full training resolution
+        (<code id="hintImgsz">640</code> px), where covered faces are much more reliably
+        picked up.
       </p>
     </section>
 
     <section class="sidepanel">
       <div class="card">
         <h2>This frame</h2>
-        <div class="statgrid">
+        <div class="statgrid" id="statGrid">
           <div class="stat"><span class="stat-label">Faces</span><span class="stat-value" id="statFaces">0</span></div>
-          <div class="stat"><span class="stat-label">Recognised</span><span class="stat-value good" id="statKnown">0</span></div>
-          <div class="stat"><span class="stat-label">Unknown</span><span class="stat-value bad" id="statUnknown">0</span></div>
-          <div class="stat"><span class="stat-label">Covered</span><span class="stat-value warn" id="statCovered">0</span></div>
+          <div class="stat recog-only"><span class="stat-label">Recognised</span><span class="stat-value good" id="statKnown">0</span></div>
+          <div class="stat recog-only"><span class="stat-label">Unknown</span><span class="stat-value bad" id="statUnknown">0</span></div>
+          <div class="stat recog-only"><span class="stat-label">Covered</span><span class="stat-value warn" id="statCovered">0</span></div>
+          <div class="stat detect-only"><span class="stat-label">Uncovered</span><span class="stat-value good" id="statNoMask">0</span></div>
+          <div class="stat detect-only"><span class="stat-label">Mask</span><span class="stat-value warn" id="statMask">0</span></div>
+          <div class="stat detect-only"><span class="stat-label">Other covering</span><span class="stat-value warn" id="statOther">0</span></div>
           <div class="stat"><span class="stat-label">Weapons</span><span class="stat-value bad" id="statWeapons">0</span></div>
           <div class="stat"><span class="stat-label">Inference</span><span class="stat-value" id="statLatency">—</span></div>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card recog-only">
         <h2>Enrolled identities <span class="count" id="galleryCount"></span></h2>
         <div class="chips" id="identityChips"><span class="muted">loading…</span></div>
         <p class="hint">
@@ -103,10 +126,17 @@
       <div class="card">
         <h2>Detector classes</h2>
         <div class="chips" id="classChips"><span class="muted">loading…</span></div>
-        <p class="hint">
+        <p class="hint" id="classHintRecognition">
           The detector localises faces and labels how covered they are, and separately flags
           weapons. A covered face still gets an identity attempt, but the embedding is much
           less reliable — expect <strong>Unknown</strong>.
+        </p>
+        <p class="hint" id="classHintDetection" hidden>
+          Live counts per class are in <em>This frame</em> above. If a class stays at zero
+          while you are clearly showing it, the detector is genuinely not firing — below about
+          90 px of subject height it stops finding faces at all, and the
+          <code>weapon</code> class fires on shapes, so it produces false positives on
+          elongated pale objects.
         </p>
       </div>
 
@@ -118,15 +148,22 @@
 
     <section class="card wide">
       <h2>How it works</h2>
+      <p class="hint" style="margin-top:-0.4rem">
+        Two pipelines share one camera frame, and the switch above picks which one runs. Both
+        start at step 2; only <strong>Recognise faces</strong> continues to steps 3 and 4.
+      </p>
       <ol class="steps">
         <li><strong>Capture</strong> — your browser grabs a frame from the webcam and encodes it as JPEG. The camera stream itself never leaves your device as video.</li>
-        <li><strong>Detect</strong> — custom-trained YOLOv8 weights locate every face and classify its covering (<code>no_mask</code>, <code>mask</code>, <code>other_coverings</code>), and flag any <code>weapon</code> in frame. If the YOLO runtime is unavailable the server falls back to dlib's HOG face detector.</li>
+        <li><strong>Detect</strong> — custom-trained YOLOv8 weights locate every face and classify its covering (<code>no_mask</code>, <code>mask</code>, <code>other_coverings</code>), and flag any <code>weapon</code> in frame. This is the whole of <em>Detect masks &amp; weapons</em> mode.</li>
         <li><strong>Describe</strong> — dlib's 68-point landmark predictor aligns each face, and the ResNet encoder maps it to a 128-dimension embedding.</li>
         <li><strong>Match</strong> — the embedding is compared by euclidean distance against the enrolled gallery. Under the threshold it is a match; over it, the face is Unknown.</li>
       </ol>
       <p class="hint">
         Everything runs on CPU on a free-tier container, so expect a couple of frames per
-        second rather than real-time video. Boxes fade while the next result is in flight.
+        second rather than real-time video. Boxes fade while the next result is in flight. In
+        recognition mode only, if the detector finds no face at all, dlib's HOG detector gets
+        a second pass — those boxes are labelled <em>coverage unknown</em>, because HOG
+        localises a face without saying anything about what is covering it.
       </p>
     </section>
 
