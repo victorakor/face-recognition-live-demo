@@ -1,7 +1,7 @@
 """Flask app for the live face-recognition demo.
 
 There is no login, no database and no server-side camera. A visitor's browser captures
-frames from their own webcam, POSTs them to /api/detect, and draws the returned boxes as
+frames from your own webcam, POSTs them to /api/detect, and draws the returned boxes as
 an overlay. Frames are decoded in memory, run through the model, and discarded -- nothing
 is written to disk.
 """
